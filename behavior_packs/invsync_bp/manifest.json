@@ -1,0 +1,30 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "InvSync BP",
+    "description": "Inventory sync MVP for Minecraft Bedrock Dedicated Server.",
+    "uuid": "8d96b847-55de-4573-b382-d3ae75be09d6",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 130]
+  },
+  "modules": [
+    {
+      "description": "Inventory sync script entrypoint.",
+      "type": "script",
+      "language": "javascript",
+      "uuid": "976b3322-b9a7-423f-b674-fc81e805cb10",
+      "version": [1, 0, 0],
+      "entry": "dist/main.js"
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "beta"
+    },
+    {
+      "module_name": "@minecraft/server-net",
+      "version": "beta"
+    }
+  ]
+}

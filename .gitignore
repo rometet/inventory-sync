@@ -1,0 +1,11 @@
+node_modules/
+dist/
+bds_ready/
+*.log
+*.zip
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.user
+*.env

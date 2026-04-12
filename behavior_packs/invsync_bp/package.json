@@ -1,0 +1,17 @@
+{
+  "name": "invsync-bp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@minecraft/common": "1.2.0",
+    "@minecraft/server": "2.8.0-beta.1.26.20-preview.23",
+    "@minecraft/server-admin": "1.0.0-beta.1.26.20-preview.23",
+    "@minecraft/server-net": "1.0.0-beta.1.26.20-preview.23",
+    "typescript": "6.0.2"
+  }
+}

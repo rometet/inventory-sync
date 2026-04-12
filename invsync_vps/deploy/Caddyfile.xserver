@@ -1,0 +1,7 @@
+your-invsync-api.example.com {
+  handle /api/inventory/* {
+    reverse_proxy 127.0.0.1:3000
+  }
+
+  respond "InvSync VPS is running" 200
+}
