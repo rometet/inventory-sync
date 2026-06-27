@@ -1,22 +1,22 @@
 # InvSync API / BDS Sidecar
 
-Node.js API and offline apply CLI for the InvSync Behavior Pack.
+InvSync Behavior Pack から呼び出される Node.js API と、DB 復元用のオフライン CLI です。
 
-The API supports two usage patterns:
+API は2つの使い方を持っています。
 
-- BP/script mode: stores snapshots sent by the Behavior Pack and does not touch the BDS world DB.
-- DB mode: copies the target world DB for save, then writes raw inventory/XP NBT back during an offline apply step.
+- BP/script方式: Behavior Pack から送られたスナップショットを保存し、BDS の `world/db` には触れません。
+- DB方式: 対象ワールド DB をコピーして保存し、BDS 停止中に raw NBT と XP を DB へ書き戻します。
 
-## Build
+## ビルド
 
 ```bash
 npm install
 npm run build
 ```
 
-## Run for BP/script mode
+## DBに触れない方式で起動する
 
-Use this when you do not want Inventory Sync to read or write `world/db`.
+Inventory Sync に `world/db` を読ませたり書かせたりしたくない場合の設定です。
 
 ```bash
 export INVSYNC_API_TOKEN=replace-me
@@ -27,7 +27,7 @@ export PORT=3000
 npm start
 ```
 
-Supported endpoints in this mode:
+この方式で使う主な API:
 
 - `POST /api/inventory/save`
 - `POST /api/inventory/backup-before-load`
@@ -36,9 +36,9 @@ Supported endpoints in this mode:
 - `POST /api/inventory/audit/load`
 - `GET /api/inventory/status`
 
-## Run for DB mode
+## DBに触れる方式で起動する
 
-Use this when you need raw NBT and XP restore. Configure a world DB source for each server ID.
+raw NBT や XP も含めて復元したい場合の設定です。サーバー ID ごとに DB の参照元を設定します。
 
 ```bash
 export INVSYNC_API_TOKEN=replace-me
@@ -55,13 +55,13 @@ export INVSYNC_WORLD_SOURCE_RESOURCE_DB_PATH="/srv/bds/resource/worlds/Bedrock l
 npm start
 ```
 
-Supported DB source types:
+対応している DB 参照元:
 
-- `local`: API process can read the local filesystem path.
-- `ftp`: API downloads/uploads the DB directory over FTP.
-- `ssh`: API downloads/uploads the DB directory over SSH.
+- `local`: API プロセスがローカルファイルシステム上の DB を読む/書く方式です。
+- `ftp`: FTP で DB ディレクトリをダウンロード/アップロードする方式です。
+- `ssh`: SSH で DB ディレクトリをダウンロード/アップロードする方式です。
 
-Environment variable pattern:
+環境変数の形式:
 
 - `INVSYNC_WORLD_SOURCE_<SERVER_ID>_TYPE`
 - `INVSYNC_WORLD_SOURCE_<SERVER_ID>_DB_PATH`
@@ -76,54 +76,54 @@ Environment variable pattern:
 - `INVSYNC_WORLD_SOURCE_<SERVER_ID>_SSH_USER`
 - `INVSYNC_WORLD_SOURCE_<SERVER_ID>_SSH_KEY_PATH`
 
-DB mode endpoints:
+DB方式で使う主な API:
 
 - `POST /api/inventory/save-db`
 - `POST /api/inventory/restore/request`
 - `GET /api/inventory/status`
 
-## Apply Pending Restores
+## 復元予約をDBへ反映する
 
-Run this only while the target BDS is stopped:
+これは対象 BDS を停止している間だけ実行してください。
 
 ```bash
 node dist/cli.js apply-pending --server-id survival
 node dist/cli.js apply-pending --server-id resource
 ```
 
-The CLI:
+CLI の処理:
 
-- reads pending restore files for the selected server
-- saves a pre-apply backup of the current player DB inventory and XP
-- writes only `Inventory`, `Armor`, `Offhand`, `SelectedInventorySlot`, and XP-related player tags
-- marks the snapshot as consumed only after DB write succeeds
-- appends readable audit logs
+- 指定したサーバー ID の復元予約を読みます。
+- 適用前のプレイヤー DB インベントリと XP をバックアップします。
+- `Inventory`、`Armor`、`Offhand`、`SelectedInventorySlot`、XP 関連タグだけを書き戻します。
+- DB 書き込み成功後にだけスナップショットを消費済みにします。
+- 読める形式の監査ログを追記します。
 
-## Status
+## 状態確認
 
 ```bash
 node dist/cli.js status --server-id survival
 node dist/cli.js status --server-id resource
 ```
 
-## Storage Layout
+## データ保存先
 
-- Latest main snapshot:
+- 最新スナップショット:
   - `<dataDir>/<namespace>/<identityType>/<playerKey>.json`
-- Automatic backups:
+- 自動バックアップ:
   - `<dataDir>/_backups/<namespace>/<identityType>/<playerKey>/latest.json`
   - `<dataDir>/_backups/<namespace>/<identityType>/<playerKey>/<timestamp>-<snapshotId>.json`
-- Pending restores:
+- 復元予約:
   - `<dataDir>/_pending_restores/<serverId>/<namespace>/<identityType>/<playerKey>.json`
-- Applied restore history:
+- 適用済み履歴:
   - `<dataDir>/_pending_restores_applied/YYYY-MM-DD/<pendingId>.json`
-- Audit log:
+- 監査ログ:
   - `<dataDir>/_audit/YYYY-MM-DD.ndjson`
   - `<dataDir>/_audit_readable/YYYY-MM-DD.log`
 
-## Safety Notes
+## 安全上の注意
 
-- `save-db` compares the live BP-visible main inventory outline with the copied DB outline. If they differ, save is rejected.
-- Live DB copy is allowed, so a very recent inventory change may not be flushed yet. Retry save if the API reports a mismatch.
-- Raw NBT restore is intentionally offline. Do not run `apply-pending` while BDS has the world DB open.
-- Keep real tokens and server paths out of Git. Use environment variables on the deployment host.
+- `save-db` は BP から見えるインベントリ概要と、コピーした DB 側の概要を比較します。一致しない場合は保存を拒否します。
+- ライブ DB のコピーは可能ですが、直近のインベントリ変更がまだ DB に反映されていないことがあります。その場合は少し待ってから再実行してください。
+- raw NBT の復元は意図的にオフライン処理です。BDS がワールド DB を開いている間に `apply-pending` を実行しないでください。
+- 実トークンや実サーバーパスは Git に入れず、運用環境の環境変数で設定してください。
