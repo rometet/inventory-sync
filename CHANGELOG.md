@@ -13,6 +13,7 @@ Initial public portfolio release.
 - automatic backup before load
 - readable audit log output
 - post-save clearing of synchronized slots
+- XP save / restore support through DB-backed player NBT tags
 - single-use load protection for saved snapshots
 - BDS bundle preparation script
 - portfolio-oriented documentation for GitHub

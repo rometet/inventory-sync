@@ -3,6 +3,7 @@ export type DynamicPropertyScalar = boolean | number | string;
 export type InventoryEquipmentSlotKey = "head" | "chest" | "legs" | "feet" | "offhand";
 export type InventoryAuditAction = "save" | "load" | "load_backup" | "backup_before_load";
 export type InventoryAuditRecordAction = Extract<InventoryAuditAction, "load" | "load_backup">;
+export type RestoreSourceKind = "snapshot" | "backup";
 
 export interface SnapshotSource {
   serverId: string;
@@ -42,6 +43,39 @@ export interface SerializedItem {
   storage?: SerializedItemStorage;
 }
 
+export interface InventoryOuterItem {
+  slot: number | string;
+  typeId: string;
+  amount: number;
+}
+
+export interface InventoryOutline {
+  main: InventoryOuterItem[];
+  equipment: InventoryOuterItem[];
+}
+
+export interface RawNbtListSnapshot {
+  elementType: number;
+  entriesBase64: string[];
+}
+
+export interface RawNbtNamedTagSnapshot {
+  name: string;
+  tagBase64: string;
+}
+
+export interface DbInventorySnapshot {
+  schemaVersion: 1;
+  playerRecordKey: string;
+  playerUniqueId?: string;
+  selectedInventorySlot?: number;
+  inventory: RawNbtListSnapshot;
+  armor: RawNbtListSnapshot;
+  offhand: RawNbtListSnapshot;
+  experience?: RawNbtNamedTagSnapshot[];
+  outline: InventoryOutline;
+}
+
 export interface InventorySnapshot {
   schemaVersion: number;
   namespace: string;
@@ -50,7 +84,10 @@ export interface InventorySnapshot {
   snapshotId?: string;
   savedAt: string;
   loadConsumedAt?: string;
+  restorePendingAt?: string;
+  restorePendingId?: string;
   source: SnapshotSource;
+  db?: DbInventorySnapshot;
   inventory: {
     selectedSlotIndex?: number;
     exclusions?: {
@@ -66,6 +103,38 @@ export interface InventorySnapshot {
       offhand: SerializedItem | null;
     };
   };
+}
+
+export interface InventoryDbSaveRequest {
+  schemaVersion: number;
+  namespace: string;
+  identityType: IdentityType;
+  playerKey: string;
+  savedAt?: string;
+  source: SnapshotSource;
+  expectedInventory?: InventoryOutline;
+}
+
+export interface InventoryRestoreRequest {
+  namespace: string;
+  identityType: IdentityType;
+  playerKey: string;
+  restoreSource: RestoreSourceKind;
+  requestedBy: string;
+  executedSource: SnapshotSource;
+}
+
+export interface PendingRestoreRequest {
+  schemaVersion: 1;
+  pendingId: string;
+  createdAt: string;
+  restoreSource: RestoreSourceKind;
+  namespace: string;
+  identityType: IdentityType;
+  playerKey: string;
+  requestedBy: string;
+  executedSource: SnapshotSource;
+  snapshot: InventorySnapshot;
 }
 
 export interface InventoryAuditEvent {
@@ -113,6 +182,10 @@ function isIdentityType(value: unknown): value is IdentityType {
 
 function isInventoryAuditRecordAction(value: unknown): value is InventoryAuditRecordAction {
   return value === "load" || value === "load_backup";
+}
+
+function isRestoreSourceKind(value: unknown): value is RestoreSourceKind {
+  return value === "snapshot" || value === "backup";
 }
 
 function isInventoryEquipmentSlotKey(value: unknown): value is InventoryEquipmentSlotKey {
@@ -231,6 +304,58 @@ function isSerializedItem(value: unknown): value is SerializedItem {
   return true;
 }
 
+function isInventoryOuterItem(value: unknown): value is InventoryOuterItem {
+  return (
+    isRecord(value) &&
+    (typeof value.slot === "number" || typeof value.slot === "string") &&
+    typeof value.typeId === "string" &&
+    isNumber(value.amount)
+  );
+}
+
+function isInventoryOutline(value: unknown): value is InventoryOutline {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.main) &&
+    value.main.every((entry) => isInventoryOuterItem(entry)) &&
+    Array.isArray(value.equipment) &&
+    value.equipment.every((entry) => isInventoryOuterItem(entry))
+  );
+}
+
+function isRawNbtListSnapshot(value: unknown): value is RawNbtListSnapshot {
+  return (
+    isRecord(value) &&
+    isNumber(value.elementType) &&
+    Array.isArray(value.entriesBase64) &&
+    value.entriesBase64.every((entry) => typeof entry === "string")
+  );
+}
+
+function isRawNbtNamedTagSnapshot(value: unknown): value is RawNbtNamedTagSnapshot {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    typeof value.tagBase64 === "string"
+  );
+}
+
+function isDbInventorySnapshot(value: unknown): value is DbInventorySnapshot {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    typeof value.playerRecordKey === "string" &&
+    (value.playerUniqueId === undefined || typeof value.playerUniqueId === "string") &&
+    (value.selectedInventorySlot === undefined || isNumber(value.selectedInventorySlot)) &&
+    isRawNbtListSnapshot(value.inventory) &&
+    isRawNbtListSnapshot(value.armor) &&
+    isRawNbtListSnapshot(value.offhand) &&
+    (value.experience === undefined ||
+      (Array.isArray(value.experience) && value.experience.every((entry) => isRawNbtNamedTagSnapshot(entry)))) &&
+    isInventoryOutline(value.outline)
+  );
+}
+
 function isSnapshotSource(value: unknown): value is SnapshotSource {
   return (
     isRecord(value) &&
@@ -290,6 +415,18 @@ export function isInventorySnapshot(value: unknown): value is InventorySnapshot 
     return false;
   }
 
+  if (value.restorePendingAt !== undefined && typeof value.restorePendingAt !== "string") {
+    return false;
+  }
+
+  if (value.restorePendingId !== undefined && typeof value.restorePendingId !== "string") {
+    return false;
+  }
+
+  if (value.db !== undefined && !isDbInventorySnapshot(value.db)) {
+    return false;
+  }
+
   if (!isRecord(value.inventory)) {
     return false;
   }
@@ -311,6 +448,47 @@ export function isInventorySnapshot(value: unknown): value is InventorySnapshot 
   }
 
   return true;
+}
+
+export function isInventoryDbSaveRequest(value: unknown): value is InventoryDbSaveRequest {
+  return (
+    isRecord(value) &&
+    isNumber(value.schemaVersion) &&
+    typeof value.namespace === "string" &&
+    isIdentityType(value.identityType) &&
+    typeof value.playerKey === "string" &&
+    (value.savedAt === undefined || typeof value.savedAt === "string") &&
+    isSnapshotSource(value.source) &&
+    (value.expectedInventory === undefined || isInventoryOutline(value.expectedInventory))
+  );
+}
+
+export function isInventoryRestoreRequest(value: unknown): value is InventoryRestoreRequest {
+  return (
+    isRecord(value) &&
+    typeof value.namespace === "string" &&
+    isIdentityType(value.identityType) &&
+    typeof value.playerKey === "string" &&
+    isRestoreSourceKind(value.restoreSource) &&
+    typeof value.requestedBy === "string" &&
+    isSnapshotSource(value.executedSource)
+  );
+}
+
+export function isPendingRestoreRequest(value: unknown): value is PendingRestoreRequest {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    typeof value.pendingId === "string" &&
+    typeof value.createdAt === "string" &&
+    isRestoreSourceKind(value.restoreSource) &&
+    typeof value.namespace === "string" &&
+    isIdentityType(value.identityType) &&
+    typeof value.playerKey === "string" &&
+    typeof value.requestedBy === "string" &&
+    isSnapshotSource(value.executedSource) &&
+    isInventorySnapshot(value.snapshot)
+  );
 }
 
 export function isInventoryAuditRecordRequest(value: unknown): value is InventoryAuditRecordRequest {

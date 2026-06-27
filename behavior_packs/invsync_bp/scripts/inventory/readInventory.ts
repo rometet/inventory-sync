@@ -8,7 +8,12 @@ import {
   ItemStack,
   Player,
 } from "@minecraft/server";
-import type { InventoryEquipmentSlotKey, InventorySnapshot, ResolvedPlayerIdentity } from "../domain/types";
+import type {
+  InventoryEquipmentSlotKey,
+  InventoryOutline,
+  InventorySnapshot,
+  ResolvedPlayerIdentity,
+} from "../domain/types";
 import { serializeItem } from "./itemSerializer";
 import { config } from "../util/config";
 import { logger } from "../util/logger";
@@ -217,4 +222,48 @@ export function createInventorySnapshot(
       },
     },
   };
+}
+
+export function createInventoryOutline(player: Player): InventoryOutline {
+  const inventoryComponent = getInventoryComponent(player);
+  const equippableComponent = getEquippableComponent(player);
+  const main: InventoryOutline["main"] = [];
+  const equipment: InventoryOutline["equipment"] = [];
+
+  for (let slot = 0; slot < inventoryComponent.container.size; slot += 1) {
+    const slotRef = tryGetContainerSlot(inventoryComponent.container, slot, "inventory-outline");
+    const item = slotRef ? tryGetItemFromSlot(slotRef, "inventory-outline", slot) : undefined;
+    if (!item) {
+      continue;
+    }
+
+    main.push({
+      slot,
+      typeId: item.typeId,
+      amount: item.amount,
+    });
+  }
+
+  const equipmentSlots: Array<[InventoryEquipmentSlotKey, EquipmentSlot]> = [
+    ["head", EquipmentSlot.Head],
+    ["chest", EquipmentSlot.Chest],
+    ["legs", EquipmentSlot.Legs],
+    ["feet", EquipmentSlot.Feet],
+    ["offhand", EquipmentSlot.Offhand],
+  ];
+
+  for (const [slotKey, equipmentSlot] of equipmentSlots) {
+    const item = tryGetItemFromSlot(equippableComponent.getEquipmentSlot(equipmentSlot), `equipment-outline:${slotKey}`);
+    if (!item) {
+      continue;
+    }
+
+    equipment.push({
+      slot: slotKey,
+      typeId: item.typeId,
+      amount: item.amount,
+    });
+  }
+
+  return { main, equipment };
 }

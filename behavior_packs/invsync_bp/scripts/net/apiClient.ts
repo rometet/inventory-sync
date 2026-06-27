@@ -9,13 +9,17 @@ import {
   type ApiOkResponse,
   type InventoryAuditRecordAction,
   type InventoryAuditRecordRequest,
+  type InventoryDbSaveRequest,
   type IdentityType,
   type InventoryLoadResponse,
+  type InventoryRestoreRequest,
+  type InventoryRestoreRequestResponse,
   type InventorySaveResponse,
   type InventorySnapshot,
   type InventoryStatusResponse,
   isApiOkResponse,
   isInventoryLoadResponse,
+  isInventoryRestoreRequestResponse,
   isInventorySaveResponse,
   isInventoryStatusResponse,
 } from "../domain/types";
@@ -25,6 +29,7 @@ type ApiErrorKind =
   | "timeout"
   | "unauthorized"
   | "not_found"
+  | "conflict"
   | "rate_limited"
   | "server_error"
   | "invalid_json"
@@ -44,21 +49,23 @@ export class ApiClientError extends Error {
   get playerMessage(): string {
     switch (this.kind) {
       case "timeout":
-        return "API リクエストがタイムアウトしました。";
+        return "APIリクエストがタイムアウトしました。";
       case "unauthorized":
-        return "API 認証に失敗しました。";
+        return "API認証に失敗しました。";
       case "not_found":
-        return "保存済みのインベントリスナップショットが見つかりません。";
+        return "保存済みのインベントリデータが見つかりません。";
+      case "conflict":
+        return "DB上のインベントリと現在のインベントリが一致しなかったため、保存を中止しました。少し待ってからもう一度saveしてください。";
       case "rate_limited":
-        return "API のレート制限に達しました。少し待ってから再試行してください。";
+        return "APIのレート制限に達しました。少し待ってから再試行してください。";
       case "server_error":
-        return "API 側でサーバーエラーが発生しました。";
+        return "API側でサーバーエラーが発生しました。";
       case "invalid_json":
-        return "API 応答の形式が不正です。";
+        return "API応答の形式が不正です。";
       case "network":
       case "unexpected_status":
       default:
-        return "API リクエストに失敗しました。";
+        return "APIリクエストに失敗しました。";
     }
   }
 }
@@ -110,6 +117,8 @@ function mapStatusError(response: HttpResponse): ApiClientError {
       return new ApiClientError("unauthorized", "Inventory API rejected the bearer token.", response.status);
     case 404:
       return new ApiClientError("not_found", "Inventory API route or resource was not found.", response.status);
+    case 409:
+      return new ApiClientError("conflict", "Inventory API rejected the request because current state did not match.", response.status);
     case 429:
       return new ApiClientError("rate_limited", "Inventory API rate limit was reached.", response.status);
     default:
@@ -164,6 +173,13 @@ export async function saveSnapshot(snapshot: InventorySnapshot): Promise<Invento
   );
 }
 
+export async function saveSnapshotFromDb(request: InventoryDbSaveRequest): Promise<InventorySaveResponse> {
+  return sendRequest(
+    createRequest(HttpRequestMethod.Post, "/api/inventory/save-db", request),
+    isInventorySaveResponse,
+  );
+}
+
 export async function backupSnapshotBeforeLoad(snapshot: InventorySnapshot): Promise<InventorySaveResponse> {
   return sendRequest(
     createRequest(HttpRequestMethod.Post, "/api/inventory/backup-before-load", snapshot),
@@ -206,14 +222,23 @@ export async function fetchSnapshotStatus(
   namespace: string,
   identityType: IdentityType,
   playerKey: string,
+  serverId: string,
 ): Promise<InventoryStatusResponse> {
   return sendRequest(
     createRequest(HttpRequestMethod.Get, "/api/inventory/status", undefined, {
       namespace,
       identityType,
       playerKey,
+      serverId,
     }),
     isInventoryStatusResponse,
+  );
+}
+
+export async function requestRestore(request: InventoryRestoreRequest): Promise<InventoryRestoreRequestResponse> {
+  return sendRequest(
+    createRequest(HttpRequestMethod.Post, "/api/inventory/restore/request", request),
+    isInventoryRestoreRequestResponse,
   );
 }
 

@@ -1,8 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { serverConfig } from "./config";
-import type { IdentityType, InventoryAuditEvent, InventorySnapshot, SnapshotSource } from "./types";
-import { isInventorySnapshot } from "./types";
+import type {
+  IdentityType,
+  InventoryAuditEvent,
+  InventorySnapshot,
+  PendingRestoreRequest,
+  RestoreSourceKind,
+  SnapshotSource,
+} from "./types";
+import { isInventorySnapshot, isPendingRestoreRequest } from "./types";
 
 const AUDIT_LOG_TIME_ZONE = "Asia/Tokyo";
 const fileOperationLocks = new Map<string, Promise<unknown>>();
@@ -11,6 +18,11 @@ export interface ConsumableSnapshotResult {
   snapshot?: InventorySnapshot;
   consumed: boolean;
   consumedAt?: string;
+}
+
+export interface RestorePendingResult {
+  pending?: PendingRestoreRequest;
+  alreadyPending: boolean;
 }
 
 function sanitizePathSegment(value: string): string {
@@ -34,8 +46,7 @@ async function withFileLock<T>(key: string, operation: () => Promise<T>): Promis
 }
 
 function createTimestampFilePart(value: string): string {
-  const safe = value.replace(/[:.]/g, "-");
-  return sanitizePathSegment(safe);
+  return sanitizePathSegment(value.replace(/[:.]/g, "-"));
 }
 
 function getSnapshotFilePath(namespace: string, identityType: IdentityType, playerKey: string): string {
@@ -61,6 +72,17 @@ function getLatestBackupFilePath(namespace: string, identityType: IdentityType, 
   return path.join(getBackupDirectoryPath(namespace, identityType, playerKey), "latest.json");
 }
 
+function getSourceSnapshotFilePath(
+  sourceKind: RestoreSourceKind,
+  namespace: string,
+  identityType: IdentityType,
+  playerKey: string,
+): string {
+  // `loadbackup` is an admin recovery path: restore from the regular saved snapshot,
+  // even if it was already consumed. `_backups` remains a pre-apply safety history.
+  return getSnapshotFilePath(namespace, identityType, playerKey);
+}
+
 function getBackupFilePaths(snapshot: InventorySnapshot): { latestFilePath: string; historyFilePath: string } {
   const backupDirectoryPath = getBackupDirectoryPath(snapshot.namespace, snapshot.identityType, snapshot.playerKey);
   const baseName = [
@@ -79,9 +101,37 @@ function getAuditFilePath(occurredAt: string): string {
   return path.join(serverConfig.dataDir, "_audit", `${sanitizePathSegment(datePart)}.ndjson`);
 }
 
+function getPendingRestoreFilePath(
+  serverId: string,
+  namespace: string,
+  identityType: IdentityType,
+  playerKey: string,
+): string {
+  return path.join(
+    serverConfig.dataDir,
+    "_pending_restores",
+    sanitizePathSegment(serverId),
+    sanitizePathSegment(namespace),
+    identityType,
+    `${sanitizePathSegment(playerKey)}.json`,
+  );
+}
+
+function getAppliedPendingRestoreFilePath(pending: PendingRestoreRequest, appliedAt: string): string {
+  const datePart = appliedAt.slice(0, 10) || "unknown-date";
+  return path.join(
+    serverConfig.dataDir,
+    "_pending_restores_applied",
+    sanitizePathSegment(datePart),
+    `${sanitizePathSegment(pending.pendingId)}.json`,
+  );
+}
+
 function createLoadableSnapshot(snapshot: InventorySnapshot): InventorySnapshot {
   const loadableSnapshot = { ...snapshot };
   delete loadableSnapshot.loadConsumedAt;
+  delete loadableSnapshot.restorePendingAt;
+  delete loadableSnapshot.restorePendingId;
   return loadableSnapshot;
 }
 
@@ -123,6 +173,8 @@ async function consumeSnapshotFile(filePath: string, label: string): Promise<Con
       ...snapshot,
       loadConsumedAt: consumedAt,
     };
+    delete consumedSnapshot.restorePendingAt;
+    delete consumedSnapshot.restorePendingId;
 
     await fs.writeFile(filePath, JSON.stringify(consumedSnapshot, null, 2), "utf8");
 
@@ -131,6 +183,61 @@ async function consumeSnapshotFile(filePath: string, label: string): Promise<Con
       consumed: false,
       consumedAt,
     };
+  });
+}
+
+async function markSnapshotPendingFile(
+  filePath: string,
+  label: string,
+  pendingId: string,
+  pendingAt: string,
+  options: { allowConsumed?: boolean } = {},
+): Promise<"marked" | "missing" | "consumed" | "pending"> {
+  return withFileLock(filePath, async () => {
+    const snapshot = await loadSnapshotFromFile(filePath, label);
+    if (!snapshot) {
+      return "missing";
+    }
+
+    if (snapshot.loadConsumedAt && !options.allowConsumed) {
+      return "consumed";
+    }
+
+    if (snapshot.restorePendingId) {
+      return "pending";
+    }
+
+    await fs.writeFile(
+      filePath,
+      JSON.stringify(
+        {
+          ...snapshot,
+          restorePendingAt: pendingAt,
+          restorePendingId: pendingId,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    return "marked";
+  });
+}
+
+async function markSnapshotConsumedFile(filePath: string, label: string, consumedAt: string): Promise<void> {
+  await withFileLock(filePath, async () => {
+    const snapshot = await loadSnapshotFromFile(filePath, label);
+    if (!snapshot) {
+      return;
+    }
+
+    const consumedSnapshot = {
+      ...snapshot,
+      loadConsumedAt: consumedAt,
+    };
+    delete consumedSnapshot.restorePendingAt;
+    delete consumedSnapshot.restorePendingId;
+    await fs.writeFile(filePath, JSON.stringify(consumedSnapshot, null, 2), "utf8");
   });
 }
 
@@ -173,7 +280,7 @@ function getJstDateTimeParts(value: string): {
 
 function formatTimestampForReadableLog(value: string | undefined): string {
   if (!value) {
-    return "不明";
+    return "unknown";
   }
 
   const parts = getJstDateTimeParts(value);
@@ -192,7 +299,7 @@ function getReadableAuditFilePath(occurredAt: string): string {
 
 function formatSourceForReadableLog(source: SnapshotSource | undefined): string {
   if (!source) {
-    return "不明";
+    return "unknown";
   }
 
   return `${source.worldName} (serverId=${source.serverId}, worldId=${source.worldId})`;
@@ -207,13 +314,13 @@ function formatReadableAuditLine(event: InventoryAuditEvent): string {
 
   switch (event.action) {
     case "save":
-      return `${occurredAt} | SAVE | player=${player} | ワールド=${executedSource}`;
+      return `${occurredAt} | SAVE | player=${player} | world=${executedSource}`;
     case "backup_before_load":
-      return `${occurredAt} | LOAD前バックアップ | player=${player} | ワールド=${executedSource}`;
+      return `${occurredAt} | BACKUP_BEFORE_LOAD | player=${player} | world=${executedSource}`;
     case "load":
-      return `${occurredAt} | LOAD | player=${player} | 実行ワールド=${executedSource} | 読み込み元=${restoredSource} | 読み込んだ保存日時=${snapshotSavedAt}`;
+      return `${occurredAt} | LOAD | player=${player} | targetWorld=${executedSource} | sourceWorld=${restoredSource} | snapshotSavedAt=${snapshotSavedAt}`;
     case "load_backup":
-      return `${occurredAt} | LOADBACKUP | player=${player} | 実行ワールド=${executedSource} | 復元元バックアップ=${restoredSource} | バックアップ保存日時=${snapshotSavedAt}`;
+      return `${occurredAt} | LOADBACKUP | player=${player} | targetWorld=${executedSource} | backupWorld=${restoredSource} | backupSavedAt=${snapshotSavedAt}`;
     default:
       return `${occurredAt} | ${event.action} | player=${player}`;
   }
@@ -261,9 +368,7 @@ export async function loadInventorySnapshot(
   identityType: IdentityType,
   playerKey: string,
 ): Promise<InventorySnapshot | undefined> {
-  const filePath = getSnapshotFilePath(namespace, identityType, playerKey);
-
-  return loadSnapshotFromFile(filePath, "Snapshot");
+  return loadSnapshotFromFile(getSnapshotFilePath(namespace, identityType, playerKey), "Snapshot");
 }
 
 export async function consumeInventorySnapshot(
@@ -279,9 +384,7 @@ export async function loadLatestBackupSnapshot(
   identityType: IdentityType,
   playerKey: string,
 ): Promise<InventorySnapshot | undefined> {
-  const filePath = getLatestBackupFilePath(namespace, identityType, playerKey);
-
-  return loadSnapshotFromFile(filePath, "Backup snapshot");
+  return loadSnapshotFromFile(getLatestBackupFilePath(namespace, identityType, playerKey), "Backup snapshot");
 }
 
 export async function consumeLatestBackupSnapshot(
@@ -290,4 +393,159 @@ export async function consumeLatestBackupSnapshot(
   playerKey: string,
 ): Promise<ConsumableSnapshotResult> {
   return consumeSnapshotFile(getLatestBackupFilePath(namespace, identityType, playerKey), "Backup snapshot");
+}
+
+export async function loadPendingRestore(
+  serverId: string,
+  namespace: string,
+  identityType: IdentityType,
+  playerKey: string,
+): Promise<PendingRestoreRequest | undefined> {
+  const filePath = getPendingRestoreFilePath(serverId, namespace, identityType, playerKey);
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isPendingRestoreRequest(parsed)) {
+      throw new Error(`Pending restore at ${filePath} has an invalid shape.`);
+    }
+
+    return parsed;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+
+    throw error;
+  }
+}
+
+export async function createPendingRestore(pending: PendingRestoreRequest): Promise<RestorePendingResult> {
+  const pendingFilePath = getPendingRestoreFilePath(
+    pending.executedSource.serverId,
+    pending.namespace,
+    pending.identityType,
+    pending.playerKey,
+  );
+
+  return withFileLock(pendingFilePath, async () => {
+    const existing = await loadPendingRestore(
+      pending.executedSource.serverId,
+      pending.namespace,
+      pending.identityType,
+      pending.playerKey,
+    );
+    if (existing) {
+      return { pending: existing, alreadyPending: true };
+    }
+
+    const sourceFilePath = getSourceSnapshotFilePath(
+      pending.restoreSource,
+      pending.namespace,
+      pending.identityType,
+      pending.playerKey,
+    );
+    const status = await markSnapshotPendingFile(
+      sourceFilePath,
+      pending.restoreSource === "backup" ? "Snapshot for loadbackup" : "Snapshot",
+      pending.pendingId,
+      pending.createdAt,
+      { allowConsumed: pending.restoreSource === "backup" },
+    );
+    if (status === "pending") {
+      return { alreadyPending: true };
+    }
+    if (status === "missing" || status === "consumed") {
+      return { alreadyPending: false };
+    }
+
+    await fs.mkdir(path.dirname(pendingFilePath), { recursive: true });
+    await fs.writeFile(pendingFilePath, JSON.stringify(pending, null, 2), "utf8");
+    return { pending, alreadyPending: false };
+  });
+}
+
+async function collectJsonFiles(root: string): Promise<string[]> {
+  let entries = [];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const nested = await Promise.all(
+    entries.map(async (entry) => {
+      const fullPath = path.join(root, entry.name);
+      if (entry.isDirectory()) {
+        return collectJsonFiles(fullPath);
+      }
+      return entry.isFile() && entry.name.endsWith(".json") ? [fullPath] : [];
+    }),
+  );
+
+  return nested.flat();
+}
+
+export async function listPendingRestores(serverId?: string): Promise<PendingRestoreRequest[]> {
+  const root = serverId
+    ? path.join(serverConfig.dataDir, "_pending_restores", sanitizePathSegment(serverId))
+    : path.join(serverConfig.dataDir, "_pending_restores");
+  const files = await collectJsonFiles(root);
+  const pending: PendingRestoreRequest[] = [];
+
+  for (const filePath of files) {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (isPendingRestoreRequest(parsed)) {
+      pending.push(parsed);
+    }
+  }
+
+  return pending;
+}
+
+export async function listInventorySnapshots(namespace = "invsync"): Promise<InventorySnapshot[]> {
+  const root = path.join(serverConfig.dataDir, sanitizePathSegment(namespace));
+  const files = await collectJsonFiles(root);
+  const snapshots: InventorySnapshot[] = [];
+
+  for (const filePath of files) {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (isInventorySnapshot(parsed)) {
+      snapshots.push(parsed);
+    }
+  }
+
+  return snapshots;
+}
+
+export async function completePendingRestore(pending: PendingRestoreRequest, appliedAt: string): Promise<void> {
+  const pendingFilePath = getPendingRestoreFilePath(
+    pending.executedSource.serverId,
+    pending.namespace,
+    pending.identityType,
+    pending.playerKey,
+  );
+  const historyFilePath = getAppliedPendingRestoreFilePath(pending, appliedAt);
+  const sourceFilePath = getSourceSnapshotFilePath(
+    pending.restoreSource,
+    pending.namespace,
+    pending.identityType,
+    pending.playerKey,
+  );
+
+  await Promise.all([
+    markSnapshotConsumedFile(
+      sourceFilePath,
+      pending.restoreSource === "backup" ? "Snapshot for loadbackup" : "Snapshot",
+      appliedAt,
+    ),
+    fs.mkdir(path.dirname(historyFilePath), { recursive: true }),
+  ]);
+
+  await fs.writeFile(historyFilePath, JSON.stringify({ ...pending, appliedAt }, null, 2), "utf8");
+  await fs.rm(pendingFilePath, { force: true });
 }

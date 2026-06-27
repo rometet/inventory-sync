@@ -1,104 +1,40 @@
 # Inventory Sync
 
-Inventory Sync is an experimental self-hosted inventory transfer system for Minecraft Bedrock Dedicated Server (BDS).
-It combines a TypeScript Behavior Pack with a small Node.js API so players can save, move, and restore inventory snapshots across BDS environments while keeping audit logs and basic duplication safeguards.
+Minecraft Bedrock Dedicated Server (BDS) 向けの、セルフホスト型インベントリ共有システムです。
 
-## Overview
+Behavior Pack と Node.js API を組み合わせて、プレイヤーのインベントリを保存・復元します。用途に合わせて、BDS の `world/db` に触れないオンライン方式と、DB を読む/書く高精度方式を選べます。
 
-This project was built to make BDS inventory transfer more explicit and easier to operate.
-Instead of relying on manual admin work, it separates the problem into two parts:
+## 使い方の全体像
 
-- a Bedrock Behavior Pack that runs in-game commands and serializes player inventory state
-- a self-hosted VPS API that stores snapshots, backups, and readable audit logs
+Inventory Sync には2つの運用モードがあります。
 
-This repository is intentionally small and practical.
-It focuses on a working end-to-end flow rather than a large platform.
+| モード | DBに触れるか | BDS停止 | 主なコマンド | 向いている用途 |
+| --- | --- | --- | --- | --- |
+| BP/script方式 | 触れない | 不要 | `/invsync:inventorybp ...` | すぐにオンラインで保存・復元したい場合 |
+| DB方式 | 触れる | 復元適用時のみ必要 | `/invsync:inventory ...` | XPやraw NBTを含めてできるだけ完全に移したい場合 |
 
-### What I implemented in this project
+迷った場合は、まずBP/script方式で動作確認してください。実運用でXPやraw NBTまで含めた移行が必要な場合だけDB方式を使います。
 
-- Behavior Pack commands for `save`, `load`, `loadbackup`, `status`, and debugging
-- inventory snapshot serialization / restoration logic
-- a Node.js API for snapshot storage, backup storage, and audit logging
-- duplication prevention rules such as post-save clearing and single-use loads
-- BDS bundle generation and deployment-oriented helper scripts
-
-## Problem
-
-On a personal or small-team BDS setup, moving inventory between worlds or server environments is usually awkward:
-
-- server operators have to manage the process manually
-- there is little traceability for who saved or loaded data
-- restoring the wrong state can overwrite the current inventory
-- repeated loads can create duplication risk
-
-Inventory Sync addresses that by making the flow explicit, logged, and self-hosted.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    Player["Player on BDS"] --> Command["InvSync Behavior Pack<br/>TypeScript / Bedrock Script API"]
-    Command -->|HTTPS| Api["InvSync VPS API<br/>Node.js + Express"]
-    Api --> Snapshot["Snapshot JSON storage"]
-    Api --> Backup["Pre-load backup storage"]
-    Api --> Audit["Audit logs<br/>NDJSON + readable log"]
-```
-
-Main runtime pieces:
-
-- `behavior_packs/invsync_bp`
-  - BDS-side commands, inventory serialization, and restore logic
-- `invsync_vps`
-  - HTTPS API that stores snapshots and load history
-- `tools/prepare_invsync_bds_pack.ps1`
-  - Generates a runtime-only BDS bundle with `permissions.json`
-
-For a more detailed walkthrough, see [docs/architecture.md](docs/architecture.md).
-
-## Features
-
-- Save the current inventory and equipment to a self-hosted API
-- Load the latest saved snapshot from another BDS environment using the same API
-- Automatically create a pre-load backup before overwriting the current inventory
-- Restore the latest automatic backup with `loadbackup`
-- Write audit logs for `save`, `load`, `loadbackup`, and pre-load backup events
-- Generate a readable log that shows who triggered save/load and from which world
-- Clear synchronized slots after `save` to reduce duplication risk
-- Mark each saved snapshot as single-use so the same save data cannot be loaded repeatedly
-- Leave unsupported portable storage slots untouched instead of pretending they were synced
-
-## Tech Stack
-
-- TypeScript
-- Node.js
-- Express
-- Minecraft Bedrock Script API
-- `@minecraft/server-net`
-- JSON file storage
-- PowerShell deployment helpers
-- VPS / HTTPS deployment
-
-## Repository Structure
+## 構成
 
 ```text
 .
 ├─ behavior_packs/
 │  └─ invsync_bp/              # Bedrock Behavior Pack source
-├─ invsync_vps/                # Node.js API for snapshot storage and audit logs
+├─ invsync_vps/                # Node.js API and offline apply CLI
 ├─ tools/
 │  └─ prepare_invsync_bds_pack.ps1
 ├─ docs/
 │  ├─ architecture.md
 │  ├─ portfolio-summary.md
 │  ├─ release-v0.1.0.md
-│  ├─ manual-github-checklist.md
-│  └─ github-profile/
+│  └─ manual-github-checklist.md
 └─ CHANGELOG.md
 ```
 
-## Quick Start
+## 共通セットアップ
 
-### 1. Prepare the VPS API
+### 1. APIをビルドする
 
 ```bash
 cd invsync_vps
@@ -106,131 +42,252 @@ npm install
 npm run build
 ```
 
-Create `.env` from [invsync_vps/.env.example](invsync_vps/.env.example) and set:
-
-- `INVSYNC_API_TOKEN`
-- `INVSYNC_DATA_DIR`
-- `INVSYNC_BIND_HOST`
-- `PORT`
-
-Start the API:
-
-```bash
-npm start
-```
-
-### 2. Configure the Behavior Pack
-
-Edit [behavior_packs/invsync_bp/scripts/util/config.ts](behavior_packs/invsync_bp/scripts/util/config.ts):
-
-```ts
-export const config = {
-  namespace: "invsync",
-  apiBaseUrl: "https://your-invsync-api.example.com",
-  apiToken: "replace-me",
-  requestTimeoutMs: 5000,
-  serverId: "server-a",
-  worldId: "world_a",
-  worldName: "World A",
-};
-```
-
-Then build the pack:
+### 2. Behavior Packをビルドする
 
 ```bash
 cd behavior_packs/invsync_bp
-npm install
+npm install --legacy-peer-deps
 npm run build
 ```
 
-### 3. Generate a BDS-ready bundle
+### 3. Behavior Pack設定を変更する
+
+`behavior_packs/invsync_bp/scripts/util/config.ts` を環境に合わせます。
+
+```ts
+export const config = {
+  schemaVersion: 1,
+  namespace: "invsync",
+  scriptNamespace: "invsync_script",
+  apiBaseUrl: "https://your-invsync-api.example.com",
+  apiToken: "replace-me",
+  requestTimeoutMs: 60000,
+  serverId: "server-a",
+  worldId: "world_a",
+  worldName: "World A",
+  adminTag: "invsync_admin",
+  commandPermissionLevel: CommandPermissionLevel.Any,
+} as const;
+```
+
+複数サーバーで使う場合は、サーバーごとに `serverId` / `worldId` / `worldName` を変えてください。
+
+### 4. BDSへ配置する
+
+ビルド後に、次をBDSへ配置します。
+
+- `behavior_packs/invsync_bp`
+- `config/<script-module-uuid>/permissions.json`
+
+`@minecraft/server-net` を使うため、`permissions.json` の `allowed_uris` にはAPIのURLを入れる必要があります。
+
+バンドル生成スクリプトを使う場合:
 
 ```powershell
 pwsh -File .\tools\prepare_invsync_bds_pack.ps1 -ApiBaseUrl "https://your-invsync-api.example.com"
 ```
 
-This prepares:
+生成物:
 
 - `bds_ready/invsync_bundle`
 - `bds_ready/invsync_bds_bundle.zip`
 
-### 4. Deploy to BDS
+`bds_ready` は生成物なのでGit管理対象外です。
 
-- copy `behavior_packs/invsync_bp`
-- copy the generated `permissions.json`
-- enable the pack on the target world
-- restart BDS
+## パターンA: DBに触れない使い方
 
-## How It Works
+BP/script方式です。BDSの `world/db` をコピーしたり書き換えたりしません。BDSを止めずに、その場で保存・復元できます。
 
-### Save flow
+### API起動
 
-1. A player runs `/invsync:inventory save`
-2. The Behavior Pack serializes the player's inventory and equipment
-3. The VPS stores the snapshot as JSON
-4. Audit logs are written
-5. The synchronized slots are cleared on the player to reduce duplication risk
+DBパス設定は不要です。
 
-### Load flow
+```bash
+export INVSYNC_API_TOKEN=replace-me
+export INVSYNC_DATA_DIR=/srv/invsync-data
+export INVSYNC_BIND_HOST=0.0.0.0
+export PORT=3000
 
-1. A player runs `/invsync:inventory load`
-2. The current inventory is first backed up automatically
-3. The VPS returns the latest snapshot if it has not been consumed yet
-4. The Behavior Pack restores the snapshot in-game
-5. The load event is written to the audit log
-6. The snapshot is marked as consumed so it cannot be loaded again
+cd invsync_vps
+npm start
+```
 
-### Backup restore flow
+### ゲーム内コマンド
 
-1. A player runs `/invsync:inventory loadbackup`
-2. The latest automatic pre-load backup is fetched
-3. The current inventory is backed up again before restore
-4. The backup snapshot is restored and audited
+```mcfunction
+/invsync:inventorybp status
+/invsync:inventorybp save
+/invsync:inventorybp load
+/invsync:inventorybp loadbackup
+```
 
-## Safety / Duplication Prevention
+短縮エイリアス:
 
-This repository deliberately includes simple safeguards instead of trying to hide risk:
+```mcfunction
+/invsync:statusbp
+/invsync:savebp
+/invsync:loadbp
+/invsync:loadbpbackup
+```
 
-- Save clears synchronized slots after the snapshot is stored
-- A saved snapshot can only be loaded once
-- Load creates a backup before overwriting the current inventory
-- `loadbackup` restores the latest automatic backup
-- Human-readable audit logs make save/load activity easy to inspect
-- Unsupported portable storage items are excluded rather than partially synced
+### 動作
 
-## Roadmap
+1. `/invsync:inventorybp save` でScript APIから読めるインベントリをAPIへ保存します。
+2. 保存成功後、保存できたインベントリ/装備スロットをclearします。
+3. XPは保存・復元・clearの対象外です。
+4. `/invsync:inventorybp load` はBDSを止めずに即時復元します。
+5. `/invsync:inventorybp loadbackup` は直前バックアップを即時復元します。
 
-- Add public demo screenshots or short GIFs
-- Add a selectable backup history instead of only the latest backup
-- Improve visibility for excluded portable storage items in status output
-- Re-check support for portable storage items if newer Bedrock Script API builds expose them safely
+### 注意点
 
-## Limitations
+- Script APIから中身を安全に読めないポータブル収納アイテムは、保存後clearの対象から外します。
+- XP共有はできません。
+- raw NBT完全復元ではありません。
+- オンラインで手早く移したい場合に向いています。
 
-- Player identity is currently based on `player.name`
-- Portable storage items such as shulker boxes are excluded on the current server runtime
-- The project assumes a self-hosted HTTPS endpoint that BDS can reach
-- Snapshot storage is JSON-file based and intentionally simple
-- `loadbackup` currently restores the latest automatic backup, not an arbitrary backup list
+## パターンB: DBに触れる使い方
 
-## Screenshots / Demo
+DB方式です。APIがBDSの `world/db` をコピーしてプレイヤーNBTを読み、復元時はBDS停止後にCLIでDBへ書き戻します。
 
-Public screenshots are not included yet.
-The repository already has a placeholder directory for future media: [docs/assets](docs/assets/README.md)
+XPやraw NBTを含めた復元に向いていますが、扱いを間違えるとプレイヤーデータを壊す可能性があります。
 
-Suggested future assets:
+### API起動
 
-- `docs/assets/inventory-sync-overview.png`
-- `docs/assets/inventory-sync-save-load.gif`
-- `docs/assets/inventory-sync-audit-log.png`
+DB方式では、対象サーバーごとにDBパスを設定します。
 
-## Additional Notes
+```bash
+export INVSYNC_API_TOKEN=replace-me
+export INVSYNC_DATA_DIR=/srv/invsync-data
+export INVSYNC_BIND_HOST=0.0.0.0
+export PORT=3000
 
-- The BDS-side implementation uses `@minecraft/server` and `@minecraft/server-net`
-- The VPS API is a small Node.js + Express service on purpose
-- This repository is sanitized for GitHub and does not include real tokens or personal deployment values
+export INVSYNC_WORLD_SOURCE_SURVIVAL_TYPE=local
+export INVSYNC_WORLD_SOURCE_SURVIVAL_DB_PATH="/srv/bds/survival/worlds/Bedrock level/db"
 
-Related docs:
+export INVSYNC_WORLD_SOURCE_RESOURCE_TYPE=local
+export INVSYNC_WORLD_SOURCE_RESOURCE_DB_PATH="/srv/bds/resource/worlds/Bedrock level_new/db"
+
+cd invsync_vps
+npm start
+```
+
+`TYPE` は `local` / `ftp` / `ssh` を指定できます。通常はAPIをBDSと同じホストまたは同じボリューム上で動かし、`local` を使うのが一番安全です。
+
+### 復元管理者タグ
+
+DB方式の `load` / `loadbackup` は復元予約を作る操作なので、管理者タグが必要です。
+
+```mcfunction
+tag <playerName> add invsync_admin
+```
+
+### ゲーム内コマンド
+
+```mcfunction
+/invsync:inventory status
+/invsync:inventory save
+/invsync:inventory load
+/invsync:inventory loadbackup
+```
+
+短縮エイリアス:
+
+```mcfunction
+/invsync:status
+/invsync:save
+/invsync:load
+/invsync:loadbackup
+```
+
+他アドオンと短縮名が競合する場合は、必ず `/invsync:inventory ...` の完全名を使ってください。
+
+### 保存フロー
+
+1. プレイヤーが `/invsync:inventory save` を実行します。
+2. Behavior Packがプレイヤー識別子と見えているインベントリ概要をAPIへ送ります。
+3. APIが設定済みの `world/db` をコピーし、LevelDB内のプレイヤーNBTを読みます。
+4. JSON概要とraw NBTを保存します。
+5. 保存成功後、プレイヤーのインベントリ/装備/XPをclearします。
+
+### 復元フロー
+
+1. 管理者タグを持つプレイヤーが `/invsync:inventory load` を実行します。
+2. APIはその場でDBを書き換えず、保留中の復元予約を作ります。
+3. 管理者が対象BDSを停止します。
+4. APIホストでCLIを実行します。
+
+```bash
+cd invsync_vps
+node dist/cli.js apply-pending --server-id survival
+```
+
+または:
+
+```bash
+node dist/cli.js apply-pending --server-id resource
+```
+
+5. CLIが現在のDB内インベントリ/XPをバックアップしてから、保存済みraw NBTを書き戻します。
+6. 書き込み成功後にスナップショットを消費済みにします。
+7. BDSを起動して復元結果を確認します。
+
+### 注意点
+
+- `apply-pending` は必ず対象BDSを停止してから実行してください。
+- 稼働中BDSが開いているLevelDBへ直接書き込まないでください。
+- 保存時のDBコピーは少し古い場合があります。DB上の内容とBPから見える内容が明らかに違う場合、保存は拒否されます。少し待って再実行してください。
+- 保存済みスナップショットは一度だけ適用できます。
+- DB方式とBP/script方式は別namespaceを使うため、保存データは混ざりません。
+
+## APIエンドポイント
+
+DB方式:
+
+- `POST /api/inventory/save-db`
+- `POST /api/inventory/restore/request`
+- `GET /api/inventory/status`
+
+BP/script方式:
+
+- `POST /api/inventory/save`
+- `POST /api/inventory/backup-before-load`
+- `GET /api/inventory/load`
+- `GET /api/inventory/load?source=backup`
+- `POST /api/inventory/audit/load`
+
+すべてBearer token認証を使います。
+
+## 安全機構
+
+- 保存成功後に元インベントリをclearして複製を防ぎます。
+- DB方式の復元はBDS停止後のCLI適用に限定します。
+- 復元前に現在のDBインベントリ/XPをバックアップします。
+- スナップショットは一度だけ適用できます。
+- 監査ログをJSONLと読みやすいログ形式で残します。
+- DB方式の復元予約は `adminTag` を持つプレイヤーだけが作れます。
+
+## 制限
+
+- プレイヤー識別は現在 `player.name` ベースです。
+- BP/script方式はXPを保存・復元しません。
+- BP/script方式はScript APIが読める範囲だけを扱います。
+- DB方式の復元はBDS停止とCLI適用が必要です。
+- スナップショット保存はJSONファイルベースです。
+- `loadbackup` は最新の自動バックアップを対象にします。
+
+## 開発用コマンド
+
+```bash
+cd invsync_vps
+npm run check
+npm run build
+
+cd ../behavior_packs/invsync_bp
+npm run check
+npm run build
+```
+
+## 関連ドキュメント
 
 - [docs/architecture.md](docs/architecture.md)
 - [docs/portfolio-summary.md](docs/portfolio-summary.md)

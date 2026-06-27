@@ -5,9 +5,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "apply-pending": "node dist/cli.js apply-pending",
     "start": "node dist/server.js"
   },
   "dependencies": {
+    "@8crafter/leveldb-zlib": "^1.6.0",
+    "basic-ftp": "^5.0.5",
     "express": "5.2.1"
   },
   "devDependencies": {

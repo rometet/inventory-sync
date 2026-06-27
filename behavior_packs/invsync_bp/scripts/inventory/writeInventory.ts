@@ -30,6 +30,13 @@ export interface ClearSyncedInventoryResult {
   warnings: string[];
 }
 
+export interface ClearSyncedInventoryOptions {
+  clearExcludedPortableStorage?: boolean;
+  clearExperience?: boolean;
+}
+
+const MAX_EXPERIENCE_DELTA = 16_777_216;
+
 function getExcludedMainSlots(snapshot: InventorySnapshot): Set<number> {
   return new Set(snapshot.inventory.exclusions?.main?.map((entry) => entry.slot) ?? []);
 }
@@ -141,6 +148,7 @@ function restoreEquipment(
 function clearInventoryForSnapshot(
   player: Player,
   snapshot: InventorySnapshot,
+  options: ClearSyncedInventoryOptions = {},
 ): ClearSyncedInventoryResult {
   const inventory = player.getComponent(EntityComponentTypes.Inventory) as EntityInventoryComponent | undefined;
   if (!inventory) {
@@ -153,9 +161,11 @@ function clearInventoryForSnapshot(
   }
 
   const warnings: string[] = [];
-  const skippedPortableStorage = describePortableStorageSkips(snapshot);
-  const excludedMainSlots = getExcludedMainSlots(snapshot);
-  const excludedEquipmentSlots = getExcludedEquipmentSlots(snapshot);
+  const skippedPortableStorage = options.clearExcludedPortableStorage ? [] : describePortableStorageSkips(snapshot);
+  const excludedMainSlots = options.clearExcludedPortableStorage ? new Set<number>() : getExcludedMainSlots(snapshot);
+  const excludedEquipmentSlots = options.clearExcludedPortableStorage
+    ? new Set<InventoryEquipmentSlotKey>()
+    : getExcludedEquipmentSlots(snapshot);
 
   for (let slot = 0; slot < inventory.container.size; slot += 1) {
     if (excludedMainSlots.has(slot)) {
@@ -192,10 +202,30 @@ function clearInventoryForSnapshot(
     }
   }
 
+  if (options.clearExperience !== false) {
+    try {
+      let remainingXp = Math.max(0, player.getTotalXp());
+      while (remainingXp > 0) {
+        const amount = Math.min(remainingXp, MAX_EXPERIENCE_DELTA);
+        player.addExperience(-amount);
+        remainingXp -= amount;
+      }
+    } catch (error) {
+      warnings.push("Failed to clear player experience.");
+      logger.warn("Failed to clear player experience after save.", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   return { skippedPortableStorage, warnings };
 }
 
-export function clearSyncedInventory(player: Player, snapshot: InventorySnapshot): Promise<ClearSyncedInventoryResult> {
+export function clearSyncedInventory(
+  player: Player,
+  snapshot: InventorySnapshot,
+  options: ClearSyncedInventoryOptions = {},
+): Promise<ClearSyncedInventoryResult> {
   return new Promise((resolve, reject) => {
     system.run(() => {
       try {
@@ -203,7 +233,7 @@ export function clearSyncedInventory(player: Player, snapshot: InventorySnapshot
           throw new Error("Player became invalid before inventory clearing started.");
         }
 
-        resolve(clearInventoryForSnapshot(player, snapshot));
+        resolve(clearInventoryForSnapshot(player, snapshot, options));
       } catch (error) {
         reject(error);
       }

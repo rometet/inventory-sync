@@ -47,6 +47,39 @@ export interface SerializedItem {
   storage?: SerializedItemStorage;
 }
 
+export interface InventoryOuterItem {
+  slot: number | string;
+  typeId: string;
+  amount: number;
+}
+
+export interface InventoryOutline {
+  main: InventoryOuterItem[];
+  equipment: InventoryOuterItem[];
+}
+
+export interface RawNbtListSnapshot {
+  elementType: number;
+  entriesBase64: string[];
+}
+
+export interface RawNbtNamedTagSnapshot {
+  name: string;
+  tagBase64: string;
+}
+
+export interface DbInventorySnapshot {
+  schemaVersion: 1;
+  playerRecordKey: string;
+  playerUniqueId?: string;
+  selectedInventorySlot?: number;
+  inventory: RawNbtListSnapshot;
+  armor: RawNbtListSnapshot;
+  offhand: RawNbtListSnapshot;
+  experience?: RawNbtNamedTagSnapshot[];
+  outline: InventoryOutline;
+}
+
 export interface InventorySnapshot {
   schemaVersion: number;
   namespace: string;
@@ -55,7 +88,10 @@ export interface InventorySnapshot {
   snapshotId?: string;
   savedAt: string;
   loadConsumedAt?: string;
+  restorePendingAt?: string;
+  restorePendingId?: string;
   source: SnapshotSource;
+  db?: DbInventorySnapshot;
   inventory: {
     selectedSlotIndex?: number;
     exclusions?: {
@@ -71,6 +107,16 @@ export interface InventorySnapshot {
       offhand: SerializedItem | null;
     };
   };
+}
+
+export interface InventoryDbSaveRequest {
+  schemaVersion: number;
+  namespace: string;
+  identityType: IdentityType;
+  playerKey: string;
+  savedAt?: string;
+  source: SnapshotSource;
+  expectedInventory?: InventoryOutline;
 }
 
 export interface InventorySaveResponse {
@@ -96,10 +142,37 @@ export interface InventoryStatusResponse {
   found: boolean;
   consumed?: boolean;
   consumedAt?: string;
+  pending?: boolean;
+  pendingId?: string;
+  pendingAt?: string;
   playerKey: string;
   identityType: IdentityType;
   savedAt?: string;
   source?: SnapshotSource;
+  snapshotMode?: "script" | "db";
+}
+
+export interface InventoryRestoreRequest {
+  namespace: string;
+  identityType: IdentityType;
+  playerKey: string;
+  restoreSource: "snapshot" | "backup";
+  requestedBy: string;
+  executedSource: SnapshotSource;
+}
+
+export interface InventoryRestoreRequestResponse {
+  ok: boolean;
+  found: boolean;
+  consumed?: boolean;
+  consumedAt?: string;
+  pending?: boolean;
+  pendingId?: string;
+  pendingAt?: string;
+  alreadyPending?: boolean;
+  playerKey: string;
+  identityType: IdentityType;
+  savedAt?: string;
 }
 
 export type InventoryAuditRecordAction = "load" | "load_backup";
@@ -168,6 +241,58 @@ function isSerializedItemStorage(value: unknown): value is SerializedItemStorage
   }
 
   return value.items.every((entry) => entry === null || isSerializedItem(entry));
+}
+
+function isInventoryOuterItem(value: unknown): value is InventoryOuterItem {
+  return (
+    isRecord(value) &&
+    (typeof value.slot === "number" || typeof value.slot === "string") &&
+    typeof value.typeId === "string" &&
+    isNumber(value.amount)
+  );
+}
+
+function isInventoryOutline(value: unknown): value is InventoryOutline {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.main) &&
+    value.main.every((entry) => isInventoryOuterItem(entry)) &&
+    Array.isArray(value.equipment) &&
+    value.equipment.every((entry) => isInventoryOuterItem(entry))
+  );
+}
+
+function isRawNbtListSnapshot(value: unknown): value is RawNbtListSnapshot {
+  return (
+    isRecord(value) &&
+    isNumber(value.elementType) &&
+    Array.isArray(value.entriesBase64) &&
+    value.entriesBase64.every((entry) => typeof entry === "string")
+  );
+}
+
+function isRawNbtNamedTagSnapshot(value: unknown): value is RawNbtNamedTagSnapshot {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    typeof value.tagBase64 === "string"
+  );
+}
+
+function isDbInventorySnapshot(value: unknown): value is DbInventorySnapshot {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    typeof value.playerRecordKey === "string" &&
+    (value.playerUniqueId === undefined || typeof value.playerUniqueId === "string") &&
+    (value.selectedInventorySlot === undefined || isNumber(value.selectedInventorySlot)) &&
+    isRawNbtListSnapshot(value.inventory) &&
+    isRawNbtListSnapshot(value.armor) &&
+    isRawNbtListSnapshot(value.offhand) &&
+    (value.experience === undefined ||
+      (Array.isArray(value.experience) && value.experience.every((entry) => isRawNbtNamedTagSnapshot(entry)))) &&
+    isInventoryOutline(value.outline)
+  );
 }
 
 function isPortableStorageExclusion(value: unknown): value is PortableStorageExclusion {
@@ -332,6 +457,18 @@ export function isInventorySnapshot(value: unknown): value is InventorySnapshot 
     return false;
   }
 
+  if (value.restorePendingAt !== undefined && typeof value.restorePendingAt !== "string") {
+    return false;
+  }
+
+  if (value.restorePendingId !== undefined && typeof value.restorePendingId !== "string") {
+    return false;
+  }
+
+  if (value.db !== undefined && !isDbInventorySnapshot(value.db)) {
+    return false;
+  }
+
   if (!isRecord(value.inventory)) {
     return false;
   }
@@ -418,8 +555,24 @@ export function isInventoryStatusResponse(value: unknown): value is InventorySta
     return false;
   }
 
+  if (value.pending !== undefined && typeof value.pending !== "boolean") {
+    return false;
+  }
+
+  if (value.pendingId !== undefined && typeof value.pendingId !== "string") {
+    return false;
+  }
+
+  if (value.pendingAt !== undefined && typeof value.pendingAt !== "string") {
+    return false;
+  }
+
   if (!value.found) {
     return true;
+  }
+
+  if (value.snapshotMode !== undefined && value.snapshotMode !== "script" && value.snapshotMode !== "db") {
+    return false;
   }
 
   return typeof value.savedAt === "string" && isSnapshotSource(value.source);
@@ -427,4 +580,46 @@ export function isInventoryStatusResponse(value: unknown): value is InventorySta
 
 export function isApiOkResponse(value: unknown): value is ApiOkResponse {
   return isRecord(value) && typeof value.ok === "boolean";
+}
+
+export function isInventoryRestoreRequestResponse(value: unknown): value is InventoryRestoreRequestResponse {
+  if (
+    !isRecord(value) ||
+    typeof value.ok !== "boolean" ||
+    typeof value.found !== "boolean" ||
+    typeof value.playerKey !== "string" ||
+    !isIdentityType(value.identityType)
+  ) {
+    return false;
+  }
+
+  if (value.consumed !== undefined && typeof value.consumed !== "boolean") {
+    return false;
+  }
+
+  if (value.consumedAt !== undefined && typeof value.consumedAt !== "string") {
+    return false;
+  }
+
+  if (value.pending !== undefined && typeof value.pending !== "boolean") {
+    return false;
+  }
+
+  if (value.pendingId !== undefined && typeof value.pendingId !== "string") {
+    return false;
+  }
+
+  if (value.pendingAt !== undefined && typeof value.pendingAt !== "string") {
+    return false;
+  }
+
+  if (value.alreadyPending !== undefined && typeof value.alreadyPending !== "boolean") {
+    return false;
+  }
+
+  if (value.savedAt !== undefined && typeof value.savedAt !== "string") {
+    return false;
+  }
+
+  return true;
 }

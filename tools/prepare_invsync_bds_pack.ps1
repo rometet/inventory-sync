@@ -63,6 +63,16 @@ $releaseManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Pat
 
 Copy-Item -Path (Join-Path $sourceDistRoot "*") -Destination $bundleScriptsRoot -Recurse -Force
 
+$bundleConfigJs = Join-Path $bundleScriptsRoot "util\config.js"
+if (Test-Path $bundleConfigJs) {
+    $configJs = Get-Content -Raw -Encoding UTF8 -LiteralPath $bundleConfigJs
+    $configJs = $configJs.Replace(
+        'apiBaseUrl: "https://your-invsync-api.example.com"',
+        'apiBaseUrl: "' + $ApiBaseUrl.TrimEnd("/") + '"'
+    )
+    Set-Content -LiteralPath $bundleConfigJs -Value $configJs -Encoding UTF8
+}
+
 $permissions = @'
 {
   "allowed_modules": [
@@ -82,6 +92,8 @@ $permissions = @'
 }
 '@
 $permissions = $permissions.Replace("__API_BASE_URL__", $ApiBaseUrl.TrimEnd("/"))
+$forceHttps = if ($ApiBaseUrl.Trim().ToLowerInvariant().StartsWith("https://")) { "true" } else { "false" }
+$permissions = $permissions.Replace('"force_https": true', '"force_https": ' + $forceHttps)
 Set-Content -LiteralPath (Join-Path (Join-Path $bundleConfigRoot $moduleUuid) "permissions.json") -Value $permissions -Encoding UTF8
 
 $setupGuide = @"
@@ -109,6 +121,7 @@ If needed, edit these values in behavior_packs/invsync_bp/scripts/util/config.js
 - serverId
 - worldId
 - worldName
+- adminTag
 
 apiBaseUrl and apiToken in scripts/util/config.js should match your own VPS.
 
@@ -118,16 +131,27 @@ apiBaseUrl and apiToken in scripts/util/config.js should match your own VPS.
 - /invsync:inventory save
 - /invsync:inventory load
 - /invsync:inventory loadbackup
+- /invsync:inventorybp status
+- /invsync:inventorybp save
+- /invsync:inventorybp load
+- /invsync:inventorybp loadbackup
+- /invsync:savebp
+- /invsync:loadbp
+- /invsync:loadbpbackup
+- /invsync:statusbp
 
 ## Notes
 
 - For multiple worlds, use different serverId / worldId / worldName values per world.
-- Portable storage items such as shulker boxes are excluded from sync on the current server build.
-- After save succeeds, synchronized inventory/equipment slots are cleared to reduce duplication risk.
-- Excluded portable storage slots are left untouched during save clearing and load.
-- Each saved snapshot can be loaded only once. Run save again to create a new loadable snapshot.
-- Every load first stores a pre-load backup of the current inventory on the VPS.
-- /invsync:inventory loadbackup restores the latest automatic pre-load backup.
+- Save reads inventory and XP from the BDS-local sidecar's world DB snapshot.
+- After save succeeds, the player's current inventory/equipment/XP is cleared.
+- Load and loadbackup create offline restore reservations instead of applying items immediately.
+- Restore reservations require the configured adminTag, default invsync_admin.
+- Stop BDS and run node dist/cli.js apply-pending --server-id <serverId> on the sidecar host to apply a pending restore.
+- Each saved snapshot can be applied only once. Run save again to create a new loadable snapshot.
+- BP/script mode commands use scriptNamespace=invsync_script and apply immediately without stopping BDS.
+- BP/script mode can only restore what Bedrock Script API can serialize; use DB mode for full raw NBT restore.
+- BP/script mode does not clear or restore XP; use DB mode when XP sharing is required.
 - This bundle uses config/$moduleUuid/permissions.json instead of config/default/permissions.json.
 - Development-only files such as node_modules and TypeScript sources are not included.
 
@@ -148,6 +172,7 @@ If you need different world metadata, edit scripts/util/config.js and adjust:
 - serverId
 - worldId
 - worldName
+- adminTag
 
 ## External API
 
@@ -156,13 +181,16 @@ If you need different world metadata, edit scripts/util/config.js and adjust:
 
 ## Sync Limits
 
-- Portable storage items such as shulker boxes are excluded from sync on the current server build.
-- When excluded items are present, save succeeds but those slots are omitted from the snapshot.
-- After save succeeds, synchronized slots are cleared. Excluded portable storage slots are left unchanged.
-- Each saved snapshot can be loaded only once. Run save again to create a new loadable snapshot.
-- During load, excluded slots are left unchanged.
-- Before each load, the current inventory is backed up on the VPS.
-- The latest automatic backup can be restored with /invsync:inventory loadbackup.
+- Save uses the BDS-local sidecar to read raw inventory and XP NBT from the world DB.
+- After save succeeds, the player's current inventory/equipment/XP is cleared.
+- Load and loadbackup create offline restore reservations.
+- Restore reservations require the configured adminTag.
+- Stop BDS and run node dist/cli.js apply-pending --server-id <serverId> on the sidecar host to apply a pending restore.
+- The latest automatic backup can be reserved with /invsync:inventory loadbackup.
+- BP/script mode is available with /invsync:inventorybp save/load/loadbackup/status and the short aliases /invsync:savebp, /invsync:loadbp, /invsync:loadbpbackup, /invsync:statusbp.
+- BP/script mode stores data under scriptNamespace=invsync_script and restores immediately while BDS is running.
+- BP/script mode is less complete than DB raw NBT mode and should be used when online convenience is more important than perfect NBT fidelity.
+- BP/script mode does not clear or restore XP; use DB mode when XP sharing is required.
 
 ## Required Server Config
 

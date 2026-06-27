@@ -10,9 +10,9 @@ import {
   Player,
 } from "@minecraft/server";
 import { playerIdentityResolver } from "../domain/playerIdentity";
-import type { InventoryAction, InventorySnapshot, ResolvedPlayerIdentity } from "../domain/types";
+import type { InventoryAction } from "../domain/types";
 import { isInventoryAction } from "../domain/types";
-import { createInventorySnapshot, getPortableStorageExclusions } from "../inventory/readInventory";
+import { createInventoryOutline, createInventorySnapshot } from "../inventory/readInventory";
 import { serializeItem } from "../inventory/itemSerializer";
 import { applyInventorySnapshot, clearSyncedInventory } from "../inventory/writeInventory";
 import {
@@ -23,13 +23,16 @@ import {
   loadSnapshot,
   recordLoadApplied,
   recordLoadBackupApplied,
+  requestRestore,
   saveSnapshot,
+  saveSnapshotFromDb,
 } from "../net/apiClient";
 import { sendError, sendInfo, sendLines, sendSuccess } from "../util/chat";
 import { config } from "../util/config";
 import { logger } from "../util/logger";
 
 const ACTION_ENUM_NAME = "invsync:inventory_action";
+const BP_ACTION_ENUM_NAME = "invsync:inventorybp_action";
 const DEFAULT_DEBUG_PREVIEW_LIMIT = 5;
 
 function getPlayerFromOrigin(origin: CustomCommandOrigin): Player | undefined {
@@ -45,203 +48,309 @@ function getPlayerFromOrigin(origin: CustomCommandOrigin): Player | undefined {
   return entity as Player;
 }
 
-function notifyPortableStorageExclusions(
-  player: Player,
-  excludedPortableStorage: string[],
-  summaryMessage: string,
-  slotsLabel: string,
-): void {
-  if (excludedPortableStorage.length === 0) {
-    return;
-  }
-
-  sendInfo(player, summaryMessage);
-  sendInfo(player, `${slotsLabel}: ${excludedPortableStorage.join(", ")}`);
-}
-
-async function savePreRestoreBackup(
-  player: Player,
-  identity: ResolvedPlayerIdentity,
-  successMessage: string,
-): Promise<void> {
-  const backupSnapshot = createInventorySnapshot(player, identity);
-  const excludedPortableStorage = getPortableStorageExclusions(backupSnapshot);
-  const backupResponse = await backupSnapshotBeforeLoad(backupSnapshot);
-
-  sendInfo(player, `${successMessage} (${backupResponse.savedAt})`);
-
-  if (excludedPortableStorage.length > 0) {
-    logger.warn("Portable storage items were excluded from the pre-restore backup.", excludedPortableStorage);
-    notifyPortableStorageExclusions(
-      player,
-      excludedPortableStorage,
-      "\u73fe\u5728\u306e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u5185\u306e\u643a\u5e2f\u53ce\u7d0d\u30a2\u30a4\u30c6\u30e0\u306f\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u5bfe\u8c61\u5916\u3067\u3059\u3002",
-      "\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u9664\u5916\u30b9\u30ed\u30c3\u30c8",
-    );
-  }
-}
-
-async function applyRestoredSnapshot(
-  player: Player,
-  snapshot: InventorySnapshot,
-  successMessage: string,
-  recordAudit: (snapshot: InventorySnapshot) => Promise<unknown>,
-  auditErrorMessage: string,
-): Promise<void> {
-  const result = await applyInventorySnapshot(player, snapshot);
-  sendSuccess(player, successMessage);
-
+function isRestoreAdmin(player: Player): boolean {
   try {
-    await recordAudit(snapshot);
-  } catch (error) {
-    logger.warn(auditErrorMessage, error instanceof Error ? error.message : String(error));
+    return player.hasTag(config.adminTag);
+  } catch {
+    return false;
   }
+}
 
-  if (result.skippedPortableStorage.length > 0) {
-    notifyPortableStorageExclusions(
-      player,
-      result.skippedPortableStorage,
-      "\u643a\u5e2f\u53ce\u7d0d\u30a2\u30a4\u30c6\u30e0\u306e\u30b9\u30ed\u30c3\u30c8\u306f\u5b89\u5168\u306e\u305f\u3081\u5909\u66f4\u3057\u3066\u3044\u307e\u305b\u3093\u3002",
-      "\u672a\u5909\u66f4\u30b9\u30ed\u30c3\u30c8",
-    );
-  }
+function getSource() {
+  return {
+    serverId: config.serverId,
+    worldId: config.worldId,
+    worldName: config.worldName,
+  };
+}
 
-  if (result.warnings.length > 0) {
-    sendInfo(player, "\u4e00\u90e8\u306e\u30a2\u30a4\u30c6\u30e0\u306f\u5fa9\u5143\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u8a73\u3057\u304f\u306f\u30b5\u30fc\u30d0\u30fc\u30ed\u30b0\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
-    logger.warn("Inventory restoration completed with warnings.", result.warnings);
-  }
+function createScriptSnapshot(player: Player) {
+  const identity = playerIdentityResolver.resolve(player);
+  const snapshot = createInventorySnapshot(player, identity);
+
+  return {
+    identity,
+    snapshot: {
+      ...snapshot,
+      namespace: config.scriptNamespace,
+    },
+  };
 }
 
 async function handleSave(player: Player): Promise<void> {
   const identity = playerIdentityResolver.resolve(player);
   const snapshot = createInventorySnapshot(player, identity);
-  const excludedPortableStorage = getPortableStorageExclusions(snapshot);
+  const expectedInventory = createInventoryOutline(player);
 
-  const response = await saveSnapshot(snapshot);
-  let clearResult: Awaited<ReturnType<typeof clearSyncedInventory>>;
+  const response = await saveSnapshotFromDb({
+    schemaVersion: config.schemaVersion,
+    namespace: config.namespace,
+    identityType: identity.identityType,
+    playerKey: identity.playerKey,
+    savedAt: snapshot.savedAt,
+    source: snapshot.source,
+    expectedInventory,
+  });
 
+  let clearResult;
   try {
-    clearResult = await clearSyncedInventory(player, snapshot);
+    clearResult = await clearSyncedInventory(player, snapshot, {
+      clearExcludedPortableStorage: true,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error("Inventory snapshot was saved, but clearing the player's inventory failed.", message);
     sendError(
       player,
-      `インベントリは保存されましたが、同期対象アイテムのクリアに失敗しました。管理者へ連絡してください。詳細: ${message}`,
+      `インベントリはDBから保存されましたが、保存後のclearに失敗しました。運営に連絡してください。詳細: ${message}`,
     );
     return;
   }
 
-  sendSuccess(player, `インベントリを保存し、同期対象アイテムをクリアしました。 (${response.savedAt})`);
-
-  if (excludedPortableStorage.length > 0) {
-    logger.warn("Portable storage items were excluded from sync.", excludedPortableStorage);
-    notifyPortableStorageExclusions(
-      player,
-      excludedPortableStorage,
-      "\u3053\u306e\u30b5\u30fc\u30d0\u30fc\u30d3\u30eb\u30c9\u3067\u306f\u643a\u5e2f\u53ce\u7d0d\u30a2\u30a4\u30c6\u30e0\u306f\u540c\u671f\u5bfe\u8c61\u5916\u3067\u3059\u3002",
-      "\u9664\u5916\u30b9\u30ed\u30c3\u30c8",
-    );
-  }
-
+  sendSuccess(player, `インベントリをDBから保存し、保存後にclearしました。(${response.savedAt})`);
   if (clearResult.warnings.length > 0) {
-    sendInfo(player, "一部のスロットはクリアできませんでした。詳しくはサーバーログを確認してください。");
+    sendInfo(player, "一部スロットのclearに失敗した可能性があります。詳しくはサーバーログを確認してください。");
     logger.warn("Inventory clearing after save completed with warnings.", clearResult.warnings);
   }
 }
 
-async function handleLoad(player: Player): Promise<void> {
+async function handleSaveBp(player: Player): Promise<void> {
+  const { snapshot } = createScriptSnapshot(player);
+  const response = await saveSnapshot(snapshot);
+
+  let clearResult;
+  try {
+    clearResult = await clearSyncedInventory(player, snapshot, {
+      clearExperience: false,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error("Script inventory snapshot was saved, but clearing the player's inventory failed.", message);
+    sendError(
+      player,
+      `BP方式でインベントリは保存されましたが、保存後のclearに失敗しました。運営に連絡してください。詳細: ${message}`,
+    );
+    return;
+  }
+
+  sendSuccess(player, `BP方式でインベントリを保存し、保存後にインベントリ/装備をclearしました。XPはBP方式では対象外です。(${response.savedAt})`);
+  if (clearResult.skippedPortableStorage.length > 0) {
+    sendInfo(
+      player,
+      `Script APIで中身を読めない携帯収納は、消失防止のためclearせず残しました: ${clearResult.skippedPortableStorage.join(", ")}`,
+    );
+  }
+  if (clearResult.warnings.length > 0) {
+    sendInfo(player, "一部スロットのclearに失敗した可能性があります。詳しくはサーバーログを確認してください。");
+    logger.warn("Script inventory clearing after save completed with warnings.", clearResult.warnings);
+  }
+}
+
+async function requestOfflineRestore(player: Player, restoreSource: "snapshot" | "backup"): Promise<void> {
+  if (!isRestoreAdmin(player)) {
+    sendError(player, `この操作は管理者専用です。必要なタグ: ${config.adminTag}`);
+    return;
+  }
+
   const identity = playerIdentityResolver.resolve(player);
-  const status = await fetchSnapshotStatus(config.namespace, identity.identityType, identity.playerKey);
+  const response = await requestRestore({
+    namespace: config.namespace,
+    identityType: identity.identityType,
+    playerKey: identity.playerKey,
+    restoreSource,
+    requestedBy: player.name,
+    executedSource: getSource(),
+  });
 
-  if (!status.found) {
-    sendInfo(player, "\u4fdd\u5b58\u6e08\u307f\u306e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3002");
+  if (!response.found) {
+    const label = restoreSource === "backup" ? "復元できる自動バックアップ" : "保存済みインベントリ";
+    sendInfo(player, `${label}が見つかりません。`);
     return;
   }
 
-  if (status.consumed) {
-    sendInfo(player, `この保存データはすでに読み込み済みです。新しく /${config.namespace}:inventory save を実行してください。`);
+  if (response.consumed) {
+    sendInfo(player, "このデータはすでに適用済みです。必要なら新しくsaveしてください。");
     return;
   }
 
-  await savePreRestoreBackup(
-    player,
-    identity,
-    "\u4e0a\u66f8\u304d\u524d\u306e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u3092\u81ea\u52d5\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u3057\u307e\u3057\u305f\u3002",
-  );
-
-  const response = await loadSnapshot(config.namespace, identity.identityType, identity.playerKey);
-
-  if (!response.found || !response.snapshot) {
-    if (response.consumed) {
-      sendInfo(player, `この保存データはすでに読み込み済みです。新しく /${config.namespace}:inventory save を実行してください。`);
-      return;
-    }
-
-    sendInfo(player, "\u4fdd\u5b58\u6e08\u307f\u306e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3002");
+  if (response.pending) {
+    const already = response.alreadyPending ? "既存の" : "新しい";
+    sendSuccess(player, `${already}復元予約があります。pendingId=${response.pendingId ?? "不明"}`);
+    sendInfo(player, `BDSを停止したあと、sidecarで node dist/cli.js apply-pending --server-id ${config.serverId} を実行してください。`);
     return;
   }
 
-  await applyRestoredSnapshot(
-    player,
-    response.snapshot,
-    "\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u306e\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u3092\u8aad\u307f\u8fbc\u307f\u307e\u3057\u305f\u3002",
-    recordLoadApplied,
-    "Failed to record completed inventory load.",
-  );
+  sendError(player, "復元予約を作成できませんでした。サーバーログを確認してください。");
+}
+
+async function handleLoad(player: Player): Promise<void> {
+  await requestOfflineRestore(player, "snapshot");
 }
 
 async function handleLoadBackup(player: Player): Promise<void> {
-  const identity = playerIdentityResolver.resolve(player);
-  const response = await loadBackupSnapshot(config.namespace, identity.identityType, identity.playerKey);
-
-  if (!response.found || !response.snapshot) {
-    if (response.consumed) {
-      sendInfo(player, "この自動バックアップはすでに復元済みです。");
-      return;
-    }
-
-    sendInfo(player, "\u5fa9\u5143\u3067\u304d\u308b\u81ea\u52d5\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3002");
-    return;
-  }
-
-  await savePreRestoreBackup(
-    player,
-    identity,
-    "\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u5fa9\u5143\u524d\u306b\u73fe\u5728\u306e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u3092\u81ea\u52d5\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u3057\u307e\u3057\u305f\u3002",
-  );
-
-  await applyRestoredSnapshot(
-    player,
-    response.snapshot,
-    "\u81ea\u52d5\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u304b\u3089\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u3092\u5fa9\u5143\u3057\u307e\u3057\u305f\u3002",
-    recordLoadBackupApplied,
-    "Failed to record completed inventory backup restore.",
-  );
+  await requestOfflineRestore(player, "backup");
 }
 
 async function handleStatus(player: Player): Promise<void> {
   const identity = playerIdentityResolver.resolve(player);
-  const response = await fetchSnapshotStatus(config.namespace, identity.identityType, identity.playerKey);
+  const response = await fetchSnapshotStatus(
+    config.namespace,
+    identity.identityType,
+    identity.playerKey,
+    config.serverId,
+  );
 
   if (!response.found) {
-    sendLines(player, "\u00A7e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u72b6\u6cc1", [
+    sendLines(player, "§eインベントリ保存状況", [
       `playerKey: ${identity.playerKey}`,
       `identityType: ${identity.identityType}`,
-      "\u4fdd\u5b58\u6e08\u307f: \u3044\u3044\u3048",
+      "保存済み: いいえ",
     ]);
     return;
   }
 
-  sendLines(player, "\u00A7e\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u72b6\u6cc1", [
+  sendLines(player, "§eインベントリ保存状況", [
     `playerKey: ${response.playerKey}`,
     `identityType: ${response.identityType}`,
-    "\u4fdd\u5b58\u6e08\u307f: \u306f\u3044",
-    `読み込み済み: ${response.consumed ? "はい" : "いいえ"}`,
-    `読み込み日時: ${response.consumedAt ?? "未読み込み"}`,
-    `\u4fdd\u5b58\u65e5\u6642: ${response.savedAt ?? "\u4e0d\u660e"}`,
-    `\u4fdd\u5b58\u5143: ${response.source?.worldName ?? "\u4e0d\u660e"} (${response.source?.serverId ?? "\u4e0d\u660e"} / ${response.source?.worldId ?? "\u4e0d\u660e"})`,
+    "保存済み: はい",
+    `保存方式: ${response.snapshotMode === "db" ? "DB raw NBT" : "Script API"}`,
+    `適用済み: ${response.consumed ? "はい" : "いいえ"}`,
+    `適用日時: ${response.consumedAt ?? "未適用"}`,
+    `復元予約中: ${response.pending ? "はい" : "いいえ"}`,
+    `予約ID: ${response.pendingId ?? "なし"}`,
+    `予約日時: ${response.pendingAt ?? "なし"}`,
+    `保存日時: ${response.savedAt ?? "不明"}`,
+    `保存元: ${response.source?.worldName ?? "不明"} (${response.source?.serverId ?? "不明"} / ${response.source?.worldId ?? "不明"})`,
   ]);
+}
+
+async function handleStatusBp(player: Player): Promise<void> {
+  const identity = playerIdentityResolver.resolve(player);
+  const response = await fetchSnapshotStatus(
+    config.scriptNamespace,
+    identity.identityType,
+    identity.playerKey,
+    config.serverId,
+  );
+
+  if (!response.found) {
+    sendLines(player, "§eBP方式インベントリ保存状況", [
+      `playerKey: ${identity.playerKey}`,
+      `identityType: ${identity.identityType}`,
+      `namespace: ${config.scriptNamespace}`,
+      "保存済み: いいえ",
+    ]);
+    return;
+  }
+
+  sendLines(player, "§eBP方式インベントリ保存状況", [
+    `playerKey: ${response.playerKey}`,
+    `identityType: ${response.identityType}`,
+    `namespace: ${config.scriptNamespace}`,
+    "保存済み: はい",
+    `保存方式: ${response.snapshotMode === "db" ? "DB raw NBT" : "Script API"}`,
+    `適用済み: ${response.consumed ? "はい" : "いいえ"}`,
+    `適用日時: ${response.consumedAt ?? "未適用"}`,
+    `保存日時: ${response.savedAt ?? "不明"}`,
+    `保存元: ${response.source?.worldName ?? "不明"} (${response.source?.serverId ?? "不明"} / ${response.source?.worldId ?? "不明"})`,
+  ]);
+}
+
+async function handleLoadBp(player: Player): Promise<void> {
+  const identity = playerIdentityResolver.resolve(player);
+  const status = await fetchSnapshotStatus(
+    config.scriptNamespace,
+    identity.identityType,
+    identity.playerKey,
+    config.serverId,
+  );
+
+  if (!status.found) {
+    sendInfo(player, "BP方式の保存済みインベントリが見つかりません。");
+    return;
+  }
+
+  if (status.consumed) {
+    sendInfo(player, "BP方式の保存データはすでに適用済みです。必要なら新しくsavebpしてください。");
+    return;
+  }
+
+  const beforeLoad = createScriptSnapshot(player).snapshot;
+  await backupSnapshotBeforeLoad(beforeLoad);
+
+  const response = await loadSnapshot(config.scriptNamespace, identity.identityType, identity.playerKey);
+  if (!response.found) {
+    sendInfo(player, "BP方式の保存済みインベントリが見つかりません。");
+    return;
+  }
+
+  if (response.consumed) {
+    sendInfo(player, "BP方式の保存データはすでに適用済みです。必要なら新しくsavebpしてください。");
+    return;
+  }
+
+  if (!response.snapshot) {
+    sendError(player, "BP方式の保存データを取得できませんでした。サーバーログを確認してください。");
+    return;
+  }
+
+  const applyResult = await applyInventorySnapshot(player, response.snapshot);
+  try {
+    await recordLoadApplied(response.snapshot);
+  } catch (error) {
+    logger.warn("Failed to record script inventory load audit event.", error);
+  }
+
+  sendSuccess(player, `BP方式でインベントリを即時復元しました。保存日時: ${response.savedAt ?? "不明"}`);
+  if (applyResult.skippedPortableStorage.length > 0) {
+    sendInfo(
+      player,
+      `Script APIで中身を読めない携帯収納は復元対象から除外されました: ${applyResult.skippedPortableStorage.join(", ")}`,
+    );
+  }
+  if (applyResult.warnings.length > 0) {
+    sendInfo(player, "一部アイテムの復元に失敗した可能性があります。詳しくはサーバーログを確認してください。");
+    logger.warn("Script inventory load completed with warnings.", applyResult.warnings);
+  }
+}
+
+async function handleLoadBackupBp(player: Player): Promise<void> {
+  const identity = playerIdentityResolver.resolve(player);
+  const response = await loadBackupSnapshot(config.scriptNamespace, identity.identityType, identity.playerKey);
+
+  if (!response.found) {
+    sendInfo(player, "BP方式で復元できる直前バックアップが見つかりません。");
+    return;
+  }
+
+  if (response.consumed) {
+    sendInfo(player, "BP方式の直前バックアップはすでに適用済みです。");
+    return;
+  }
+
+  if (!response.snapshot) {
+    sendError(player, "BP方式の直前バックアップを取得できませんでした。サーバーログを確認してください。");
+    return;
+  }
+
+  const applyResult = await applyInventorySnapshot(player, response.snapshot);
+  try {
+    await recordLoadBackupApplied(response.snapshot);
+  } catch (error) {
+    logger.warn("Failed to record script inventory backup load audit event.", error);
+  }
+
+  sendSuccess(player, `BP方式の直前バックアップを即時復元しました。保存日時: ${response.savedAt ?? "不明"}`);
+  if (applyResult.skippedPortableStorage.length > 0) {
+    sendInfo(
+      player,
+      `Script APIで中身を読めない携帯収納は復元対象から除外されました: ${applyResult.skippedPortableStorage.join(", ")}`,
+    );
+  }
+  if (applyResult.warnings.length > 0) {
+    sendInfo(player, "一部アイテムの復元に失敗した可能性があります。詳しくはサーバーログを確認してください。");
+    logger.warn("Script inventory backup load completed with warnings.", applyResult.warnings);
+  }
 }
 
 function getInventorySlotItem(player: Player, slot: number) {
@@ -267,41 +376,41 @@ function inspectNestedItemInventory(slot: number, player: Player): string[] {
   const { containerSize, item } = getInventorySlotItem(player, slot);
 
   const lines = [
-    `\u8981\u6c42\u30b9\u30ed\u30c3\u30c8: ${slot}`,
-    `\u9078\u629e\u4e2d\u30b9\u30ed\u30c3\u30c8: ${player.selectedSlotIndex}`,
-    `\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u30b5\u30a4\u30ba: ${containerSize}`,
+    `要求スロット: ${slot}`,
+    `選択中スロット: ${player.selectedSlotIndex}`,
+    `インベントリサイズ: ${containerSize}`,
   ];
 
   if (!item) {
-    lines.push("\u30a2\u30a4\u30c6\u30e0\u3042\u308a: \u3044\u3044\u3048");
+    lines.push("アイテムあり: いいえ");
     return lines;
   }
 
-  lines.push("\u30a2\u30a4\u30c6\u30e0\u3042\u308a: \u306f\u3044");
+  lines.push("アイテムあり: はい");
   lines.push(`typeId: ${item.typeId}`);
-  lines.push(`\u500b\u6570: ${item.amount}`);
+  lines.push(`個数: ${item.amount}`);
 
   let inventoryComponent: ItemInventoryComponent | undefined;
   try {
     inventoryComponent = item.getComponent(ItemComponentTypes.Inventory) as ItemInventoryComponent | undefined;
-    lines.push(`inventoryComponent: ${inventoryComponent ? "\u3042\u308a" : "\u306a\u3057"}`);
+    lines.push(`inventoryComponent: ${inventoryComponent ? "あり" : "なし"}`);
   } catch (error) {
-    lines.push(`inventoryComponent: \u30a8\u30e9\u30fc (${error instanceof Error ? error.message : String(error)})`);
+    lines.push(`inventoryComponent: エラー (${error instanceof Error ? error.message : String(error)})`);
   }
 
   const serialized = serializeItem(item, slot);
-  lines.push(`serializedStorage: ${serialized?.storage ? "\u3042\u308a" : "\u306a\u3057"}`);
+  lines.push(`serializedStorage: ${serialized?.storage ? "あり" : "なし"}`);
 
   if (serialized?.storage) {
     const serializedNonEmpty = serialized.storage.items.filter((entry) => entry !== null).length;
-    lines.push(`serializedStorage \u30b5\u30a4\u30ba: ${serialized.storage.size ?? serialized.storage.items.length}`);
-    lines.push(`serializedStorage \u975e\u7a7a\u30b9\u30ed\u30c3\u30c8\u6570: ${serializedNonEmpty}`);
+    lines.push(`serializedStorage サイズ: ${serialized.storage.size ?? serialized.storage.items.length}`);
+    lines.push(`serializedStorage 非空スロット数: ${serializedNonEmpty}`);
     const preview = serialized.storage.items
       .map((entry, index) => (entry ? `${index}:${entry.typeId}x${entry.amount}` : undefined))
       .filter((entry): entry is string => entry !== undefined)
       .slice(0, DEFAULT_DEBUG_PREVIEW_LIMIT);
 
-    lines.push(`serialized \u30d7\u30ec\u30d3\u30e5\u30fc: ${preview.length > 0 ? preview.join(", ") : "\u7a7a"}`);
+    lines.push(`serialized プレビュー: ${preview.length > 0 ? preview.join(", ") : "空"}`);
   }
 
   if (!inventoryComponent) {
@@ -311,7 +420,7 @@ function inspectNestedItemInventory(slot: number, player: Player): string[] {
   try {
     const nestedContainer = inventoryComponent.container;
     const nestedSize = nestedContainer.size;
-    lines.push(`nestedContainer \u30b5\u30a4\u30ba: ${nestedSize}`);
+    lines.push(`nestedContainer サイズ: ${nestedSize}`);
 
     const preview: string[] = [];
     let nonEmpty = 0;
@@ -328,27 +437,42 @@ function inspectNestedItemInventory(slot: number, player: Player): string[] {
       }
     }
 
-    lines.push(`nestedContainer \u975e\u7a7a\u30b9\u30ed\u30c3\u30c8\u6570: ${nonEmpty}`);
-    lines.push(`nested \u30d7\u30ec\u30d3\u30e5\u30fc: ${preview.length > 0 ? preview.join(", ") : "\u7a7a"}`);
+    lines.push(`nestedContainer 非空スロット数: ${nonEmpty}`);
+    lines.push(`nested プレビュー: ${preview.length > 0 ? preview.join(", ") : "空"}`);
   } catch (error) {
-    lines.push(`nestedContainer: \u30a8\u30e9\u30fc (${error instanceof Error ? error.message : String(error)})`);
+    lines.push(`nestedContainer: エラー (${error instanceof Error ? error.message : String(error)})`);
   }
 
   return lines;
 }
 
 function getUnexpectedErrorMessage(action: InventoryAction, error: unknown): string {
-  const reason = error instanceof Error && error.message ? ` \u8a73\u7d30: ${error.message}` : "";
+  const reason = error instanceof Error && error.message ? ` 詳細: ${error.message}` : "";
 
   switch (action) {
     case "save":
-      return `\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u306e\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002${reason}`;
+      return `DBからのインベントリ保存に失敗しました。${reason}`;
     case "load":
-      return `\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u306e\u30b9\u30ca\u30c3\u30d7\u30b7\u30e7\u30c3\u30c8\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002${reason}`;
+      return `インベントリ復元予約の作成に失敗しました。${reason}`;
     case "loadbackup":
-      return `\u81ea\u52d5\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u304b\u3089\u306e\u5fa9\u5143\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002${reason}`;
+      return `バックアップ復元予約の作成に失敗しました。${reason}`;
     case "status":
-      return `\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u72b6\u6cc1\u306e\u53d6\u5f97\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002${reason}`;
+      return `インベントリ状態の取得に失敗しました。${reason}`;
+  }
+}
+
+function getUnexpectedBpErrorMessage(action: InventoryAction, error: unknown): string {
+  const reason = error instanceof Error && error.message ? ` 詳細: ${error.message}` : "";
+
+  switch (action) {
+    case "save":
+      return `BP方式のインベントリ保存に失敗しました。${reason}`;
+    case "load":
+      return `BP方式のインベントリ即時復元に失敗しました。${reason}`;
+    case "loadbackup":
+      return `BP方式の直前バックアップ復元に失敗しました。${reason}`;
+    case "status":
+      return `BP方式のインベントリ状態の取得に失敗しました。${reason}`;
   }
 }
 
@@ -380,13 +504,42 @@ async function runInventoryAction(player: Player, action: InventoryAction): Prom
   }
 }
 
+async function runInventoryBpAction(player: Player, action: InventoryAction): Promise<void> {
+  try {
+    switch (action) {
+      case "save":
+        await handleSaveBp(player);
+        return;
+      case "load":
+        await handleLoadBp(player);
+        return;
+      case "loadbackup":
+        await handleLoadBackupBp(player);
+        return;
+      case "status":
+        await handleStatusBp(player);
+        return;
+    }
+  } catch (error) {
+    logger.error(`Script inventory command failed for action "${action}".`, error);
+
+    if (error instanceof ApiClientError) {
+      sendError(player, error.playerMessage);
+      return;
+    }
+
+    sendError(player, getUnexpectedBpErrorMessage(action, error));
+  }
+}
+
 export function registerInventoryCommand(customCommandRegistry: CustomCommandRegistry): void {
   customCommandRegistry.registerEnum(ACTION_ENUM_NAME, ["save", "load", "loadbackup", "status"]);
+  customCommandRegistry.registerEnum(BP_ACTION_ENUM_NAME, ["save", "load", "loadbackup", "status"]);
 
   customCommandRegistry.registerCommand(
     {
       name: `${config.namespace}:inventory`,
-      description: "\u30a4\u30f3\u30d9\u30f3\u30c8\u30ea\u306e\u4fdd\u5b58\u3001\u8aad\u307f\u8fbc\u307f\u3001\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u5fa9\u5143\u3001\u72b6\u614b\u78ba\u8a8d\u3092\u884c\u3044\u307e\u3059\u3002",
+      description: "インベントリの保存、復元予約、バックアップ復元予約、状態確認を行います。",
       permissionLevel: config.commandPermissionLevel,
       mandatoryParameters: [
         {
@@ -401,14 +554,14 @@ export function registerInventoryCommand(customCommandRegistry: CustomCommandReg
       if (!player) {
         return {
           status: CustomCommandStatus.Failure,
-          message: "\u3053\u306e\u30b3\u30de\u30f3\u30c9\u306f\u30d7\u30ec\u30a4\u30e4\u30fc\u306e\u307f\u5b9f\u884c\u3067\u304d\u307e\u3059\u3002",
+          message: "このコマンドはプレイヤーのみ実行できます。",
         };
       }
 
       if (!isInventoryAction(action)) {
         return {
           status: CustomCommandStatus.Failure,
-          message: "action \u306b\u306f save / load / loadbackup / status \u306e\u3044\u305a\u308c\u304b\u3092\u6307\u5b9a\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+          message: "action には save / load / loadbackup / status のいずれかを指定してください。",
         };
       }
 
@@ -417,10 +570,93 @@ export function registerInventoryCommand(customCommandRegistry: CustomCommandReg
     },
   );
 
+  for (const action of ["save", "load", "loadbackup", "status"] as const) {
+    customCommandRegistry.registerCommand(
+      {
+        name: `${config.namespace}:${action}`,
+        description: `InvSync ${action}`,
+        permissionLevel: config.commandPermissionLevel,
+      },
+      (origin) => {
+        const player = getPlayerFromOrigin(origin);
+        if (!player) {
+          return {
+            status: CustomCommandStatus.Failure,
+            message: "このコマンドはプレイヤーのみ実行できます。",
+          };
+        }
+
+        void runInventoryAction(player, action);
+        return undefined;
+      },
+    );
+  }
+
+  customCommandRegistry.registerCommand(
+    {
+      name: `${config.namespace}:inventorybp`,
+      description: "BP方式でインベントリの保存、即時復元、直前バックアップ復元、状態確認を行います。",
+      permissionLevel: config.commandPermissionLevel,
+      mandatoryParameters: [
+        {
+          name: "action",
+          type: CustomCommandParamType.Enum,
+          enumName: BP_ACTION_ENUM_NAME,
+        },
+      ],
+    },
+    (origin, action) => {
+      const player = getPlayerFromOrigin(origin);
+      if (!player) {
+        return {
+          status: CustomCommandStatus.Failure,
+          message: "このコマンドはプレイヤーのみ実行できます。",
+        };
+      }
+
+      if (!isInventoryAction(action)) {
+        return {
+          status: CustomCommandStatus.Failure,
+          message: "action には save / load / loadbackup / status のいずれかを指定してください。",
+        };
+      }
+
+      void runInventoryBpAction(player, action);
+      return undefined;
+    },
+  );
+
+  for (const [action, alias] of [
+    ["save", "savebp"],
+    ["load", "loadbp"],
+    ["loadbackup", "loadbpbackup"],
+    ["status", "statusbp"],
+  ] as const) {
+    customCommandRegistry.registerCommand(
+      {
+        name: `${config.namespace}:${alias}`,
+        description: `InvSync BP ${action}`,
+        permissionLevel: config.commandPermissionLevel,
+      },
+      (origin) => {
+        const player = getPlayerFromOrigin(origin);
+        if (!player) {
+          return {
+            status: CustomCommandStatus.Failure,
+            message: "このコマンドはプレイヤーのみ実行できます。",
+          };
+        }
+
+        void runInventoryBpAction(player, action);
+        return undefined;
+      },
+    );
+  }
+
   customCommandRegistry.registerCommand(
     {
       name: `${config.namespace}:debugslot`,
-      description: "\u6307\u5b9a\u30b9\u30ed\u30c3\u30c8\u306e\u643a\u5e2f\u53ce\u7d0d\u30b3\u30f3\u30dd\u30fc\u30cd\u30f3\u30c8\u60c5\u5831\u3092\u78ba\u8a8d\u3057\u307e\u3059\u3002",
+      description: "指定スロットの携帯収納コンポーネント情報を確認します。",
       permissionLevel: config.commandPermissionLevel,
       optionalParameters: [
         {
@@ -434,7 +670,7 @@ export function registerInventoryCommand(customCommandRegistry: CustomCommandReg
       if (!player) {
         return {
           status: CustomCommandStatus.Failure,
-          message: "\u3053\u306e\u30b3\u30de\u30f3\u30c9\u306f\u30d7\u30ec\u30a4\u30e4\u30fc\u306e\u307f\u5b9f\u884c\u3067\u304d\u307e\u3059\u3002",
+          message: "このコマンドはプレイヤーのみ実行できます。",
         };
       }
 
@@ -442,13 +678,20 @@ export function registerInventoryCommand(customCommandRegistry: CustomCommandReg
 
       try {
         const lines = inspectNestedItemInventory(targetSlot, player);
-        sendLines(player, "\u00A7e\u643a\u5e2f\u53ce\u7d0d\u30c7\u30d0\u30c3\u30b0", lines);
+        sendLines(player, "§e携帯収納デバッグ", lines);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        sendError(player, `\u30c7\u30d0\u30c3\u30b0\u78ba\u8a8d\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u8a73\u7d30: ${message}`);
+        sendError(player, `デバッグ確認に失敗しました。詳細: ${message}`);
       }
 
       return undefined;
     },
   );
+
+  logger.info("InvSync commands registered.", {
+    inventory: `${config.namespace}:inventory`,
+    aliases: ["save", "load", "loadbackup", "status"].map((action) => `${config.namespace}:${action}`),
+    inventorybp: `${config.namespace}:inventorybp`,
+    bpAliases: ["savebp", "loadbp", "loadbpbackup", "statusbp"].map((action) => `${config.namespace}:${action}`),
+  });
 }
